@@ -21,12 +21,15 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { assertNever } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Session } from '@deepseek-ai/dsh-session'
 import { authorizePeer, authorizeSettlement, resolveWorkspacePath } from './authorize.ts'
 import { admitContent, buildTaskMessage, deliverTask } from './delivery.ts'
 import type { ReportStore } from './external.ts'
 import type { TaskLedger } from './ledger.ts'
+import { isTokenBuckets, staffRoles } from './panel.ts'
 import { DispatchRateLimiter } from './rate-limit.ts'
-import { TaskId, type DeliveryMode, type TaskRecord } from './types.ts'
+import { TaskId, type DeliveryMode, type TaskRecord, type TokenBuckets } from './types.ts'
 
 /** Resolved plugin configuration the tools read. */
 export interface ToolsConfig {
@@ -208,6 +211,43 @@ function requireCaller(agent: { id: SessionId } | undefined, tool: string): Sess
  * @param taskId - the task the notice concerns.
  * @param text - the notice body.
  */
+/**
+ * Snapshot the dispatch-time token totals of a task's participants.
+ *
+ * The panel computes task-period consumption as `current projection − this
+ * snapshot`, so the snapshot is taken once, at dispatch, and never refreshed.
+ * A participant that is offline, or a profile without the projection
+ * registry, simply leaves its key out of the record — the panel then shows
+ * that staff row's delta as unavailable.
+ *
+ * @param ctx - plugin context; services are read via `ctx.get` and may be absent.
+ * @param initiator - the dispatching session.
+ * @param executor - the target session.
+ * @param reviewer - the named reviewer, or `undefined` for the initiator default.
+ * @returns the token snapshot keyed by participant session id, or `undefined`
+ *   when no participant's usage could be read.
+ */
+function snapshotTokensAtDispatch(
+  ctx: Context,
+  initiator: SessionId,
+  executor: SessionId,
+  reviewer: SessionId | undefined,
+): Record<string, TokenBuckets> | undefined {
+  const projections = ctx.get('sessionProjections') as
+    | { snapshot(session: Session): { values: Record<string, unknown> } }
+    | undefined
+  const agents = ctx.get('agents') as { get(id: string): Agent | undefined } | undefined
+  if (projections === undefined || agents === undefined) return undefined
+  const out: Record<string, TokenBuckets> = {}
+  for (const { sessionId } of staffRoles(initiator, executor, reviewer)) {
+    const agent = agents.get(sessionId)
+    if (agent === undefined) continue
+    const value = projections.snapshot(agent.session).values.tokenUsage
+    if (isTokenBuckets(value)) out[sessionId] = value
+  }
+  return Object.keys(out).length === 0 ? undefined : out
+}
+
 export function notifySession(ctx: Context, sessionId: SessionId, taskId: TaskId, text: string): void {
   const session = ctx.agents.get(sessionId)
   if (session === undefined) return
@@ -412,6 +452,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         reviewer = args.reviewer as SessionId
       }
       const message = buildTaskMessage(callerId, taskId, admitted.content)
+      const tokensAtStart = snapshotTokensAtDispatch(ctx, callerId, targetId, reviewer)
       const recorded = await ledger.record({
         id: taskId,
         assignedBy: callerId,
@@ -422,6 +463,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         mode,
         messageId: message.id,
         retries: 0,
+        ...(tokensAtStart !== undefined ? { tokensAtStart } : {}),
       }, config.maxPendingPerAgent)
       if (!recorded.ok) throw new Error(recorded.message)
 

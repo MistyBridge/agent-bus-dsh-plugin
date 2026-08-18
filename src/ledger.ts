@@ -33,6 +33,7 @@ import {
   type TaskOutcome,
   type TaskRecord,
   type TaskStatus,
+  type TokenBuckets,
 } from './types.ts'
 
 /**
@@ -90,6 +91,12 @@ export interface NewTask {
   readonly messageId: string
   /** Rework count; starts at 0 for a fresh task. */
   readonly retries: number
+  /**
+   * Dispatch-time token totals per participant session (deduplicated staff).
+   * Optional: an offline session or an absent projection registry simply
+   * leaves its key out, and the panel shows the delta as unavailable.
+   */
+  readonly tokensAtStart?: Record<string, TokenBuckets>
 }
 
 /** Result of a ledger mutation. */
@@ -166,6 +173,7 @@ export class TaskLedger {
         createdAt: now,
         updatedAt: now,
         ...(task.assignedReviewer !== undefined ? { assignedReviewer: task.assignedReviewer } : {}),
+        ...(task.tokensAtStart !== undefined ? { tokensAtStart: task.tokensAtStart } : {}),
       }
       await this.table.put(record.id, record)
       const state = this.global.get()

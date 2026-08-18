@@ -32,8 +32,10 @@ import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-storage-domain'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-workspace'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { ReportStore } from './external.ts'
 import { TaskLedger } from './ledger.ts'
+import { buildPanelSnapshot } from './panel.ts'
 import { DispatchRateLimiter } from './rate-limit.ts'
 import { notifySession, registerAgentBusTools, type ToolsConfig } from './tools.ts'
 
@@ -131,6 +133,47 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     workspaces: ctx.workspaceRegistry,
     limiter,
     reports,
+  })
+
+  // Task panel state route. The browser floater polls this snapshot every two
+  // seconds. `webServer` exists only in Web profiles and may bind after this
+  // plugin under concurrent activation, so the route registers lazily: try
+  // now, then on each service-binding event. A webless profile stays
+  // tool-only and never blocks boot.
+  let webRegistered = false
+  const registerWebSurface = (): void => {
+    if (webRegistered) return
+    const webServer = ctx.get('webServer') as
+      | { register(route: {
+        kind: 'exact' | 'prefix'
+        path: string
+        handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+      }): () => void }
+      | undefined
+    if (webServer === undefined) return
+    webRegistered = true
+    ctx.effect(() => webServer.register({
+      kind: 'exact',
+      path: '/plugins/dsh-agent-bus/state',
+      handler: async (_req, res) => {
+        try {
+          const snapshot = await buildPanelSnapshot(ctx, ledger, reports)
+          res.writeHead(200, {
+            'content-type': 'application/json; charset=utf-8',
+            'cache-control': 'no-store',
+          })
+          res.end(JSON.stringify(snapshot))
+        } catch (error: unknown) {
+          ctx.logger.warn(`agent-bus: state route failed: ${String(error)}`)
+          res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify({ error: 'snapshot-failed' }))
+        }
+      },
+    }), 'agent-bus: panel route')
+  }
+  registerWebSurface()
+  ctx.on('internal/service', (name) => {
+    if (name === 'webServer') registerWebSurface()
   })
 
   // Ledger state follows the real inbox lifecycle. The events are scope-filtered

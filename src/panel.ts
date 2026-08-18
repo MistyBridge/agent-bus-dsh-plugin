@@ -1,0 +1,416 @@
+/**
+ * Panel snapshot builder for the v1.1 task panel route.
+ *
+ * Serves the browser floater one whole workspace-scoped snapshot per poll:
+ * the workspace directory, the session directory (with live flags), every
+ * task projected to the panel's read view, and status counters. All inputs
+ * come through `ctx.get` so the snapshot degrades — never throws — when a
+ * service the Web profile mounts is absent.
+ *
+ * Token figures are the panel's only non-ledger data. A session's global
+ * usage is dsh's own (token-meter projection, shown by the native UI); this
+ * module only computes the task-period delta (`tokensAtStart` snapshot taken
+ * at dispatch, see tools.ts) and its sum. Staff rows whose current projection
+ * or starting snapshot is unavailable carry `null` and the sum is partial.
+ *
+ * @module dsh-agent-bus/panel
+ */
+
+import type { Context } from '@deepseek-ai/cordis'
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
+import type { Session } from '@deepseek-ai/dsh-session'
+import type { WorkspaceRegistry, Workspace } from '@deepseek-ai/dsh-workspace'
+import type { ReportStore } from './external.ts'
+import type { TaskLedger } from './ledger.ts'
+import type { TaskRecord, TokenBuckets } from './types.ts'
+import { fallbackTitle, readTitlesFile } from './titles.ts'
+
+export type { TokenBuckets } from './types.ts'
+
+/** Four-bucket token usage reported by the token-meter projection. */
+const TOKEN_KEYS = ['uncachedInputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens'] as const
+
+/** Whether a value has the token-meter projection's bucket shape. */
+export function isTokenBuckets(value: unknown): value is TokenBuckets {
+  if (typeof value !== 'object' || value === null) return false
+  const record = value as Record<string, unknown>
+  return TOKEN_KEYS.every(key =>
+    typeof record[key] === 'number' && Number.isFinite(record[key]) && record[key] >= 0)
+}
+
+/** One workspace entry in the snapshot directory. */
+export interface WorkspaceView {
+  readonly id: string
+  readonly title: string
+  readonly path: string
+}
+
+/** One session in the snapshot directory. */
+export interface SessionView {
+  readonly id: string
+  readonly title: string
+  readonly workspaceId: string | null
+  readonly live: boolean
+}
+
+/** One participant on a task card's staff directory. */
+export interface StaffEntry {
+  readonly sessionId: string
+  readonly title: string
+  readonly role: 'initiator' | 'executor' | 'reviewer'
+  readonly live: boolean
+  /** Task-period token delta; unavailable projection or start snapshot → null. */
+  readonly tokensInTask: TokenBuckets | null
+}
+
+/** One task row projected for the panel. Report text is never included. */
+export interface TaskView {
+  readonly id: string
+  readonly workspacePath: string
+  readonly status: TaskRecord['status']
+  readonly settled: boolean
+  readonly content: string
+  readonly contentPreview: string
+  readonly mode: TaskRecord['mode']
+  readonly assignedBy: string
+  readonly assignedTo: string | null
+  readonly assignedReviewer: string | null
+  readonly byTitle: string
+  readonly toTitle: string | null
+  readonly reviewerTitle: string | null
+  readonly retries: number
+  readonly reason: string | null
+  readonly outcome: TaskRecord['outcome'] | null
+  readonly feedback: string | null
+  readonly question: string | null
+  readonly reportZone: 'inline' | 'hot' | 'cold' | 'missing' | null
+  readonly hasReportRef: boolean
+  readonly turn: number | null
+  readonly staff: readonly StaffEntry[]
+  readonly taskTokensTotal: TokenBuckets | null
+  readonly createdAt: string
+  readonly updatedAt: string
+  readonly ageMs: number
+  readonly updatedMs: number
+}
+
+/** Status counters, mirroring the client panel-model keys. */
+export interface PanelStats {
+  readonly submitted: number
+  readonly working: number
+  readonly 'input-required': number
+  readonly completed: number
+  readonly failed: number
+  readonly canceled: number
+  readonly total: number
+}
+
+/** The full document served by GET /plugins/dsh-agent-bus/state. */
+export interface PanelSnapshot {
+  readonly workspaces: readonly WorkspaceView[]
+  readonly sessions: readonly SessionView[]
+  readonly tasks: readonly TaskView[]
+  readonly stats: PanelStats
+}
+
+/** Structural face of the projection registry (Service, optional at runtime). */
+interface ProjectionRegistryLike {
+  snapshot(session: Session): { values: Record<string, unknown> }
+}
+
+/** Structural face of the agent registry (already injected as `agents`). */
+interface AgentRegistryLike {
+  get(id: string): Agent | undefined
+}
+
+/** Mutable stats accumulator; the builder fills it in creation order. */
+type MutableStats = { -readonly [K in keyof PanelStats]: number }
+
+/** Empty stats row. */
+function emptyStats(): MutableStats {
+  return {
+    submitted: 0, working: 0, 'input-required': 0,
+    completed: 0, failed: 0, canceled: 0, total: 0,
+  }
+}
+
+/**
+ * Truncate by Unicode code point so a surrogate pair (emoji) is never split;
+ * overflow is marked with a single ellipsis. Mirrors the client model.
+ *
+ * @param text - the text to truncate.
+ * @param max - maximum code points before the ellipsis.
+ * @returns the truncated text.
+ */
+export function truncateCodePoints(text: string, max: number): string {
+  if (max <= 0) return text === '' ? '' : '…'
+  const points = Array.from(text)
+  if (points.length <= max) return text
+  return `${points.slice(0, max).join('')}…`
+}
+
+/**
+ * Locate an externalized report in the two-zone store.
+ *
+ * @param reports - the report store.
+ * @param task - the row whose report zone is asked for.
+ * @returns `'inline'` when the report rides the row, `'hot'` / `'cold'` when
+ *   the file exists in the matching zone, `'missing'` when the reference
+ *   names a file in neither zone, and `null` when the task has no report.
+ */
+export async function detectReportZone(
+  reports: ReportStore,
+  task: TaskRecord,
+): Promise<TaskView['reportZone']> {
+  if (task.report !== undefined && task.reportRef === undefined) return 'inline'
+  if (task.reportRef === undefined) return null
+  if (await reports.existsHot(task.reportRef)) return 'hot'
+  if (await reports.existsCold(task.reportRef)) return 'cold'
+  return 'missing'
+}
+
+/** Whether a completed row has been settled. */
+function isSettled(task: TaskRecord): boolean {
+  return task.status === 'completed'
+    ? task.outcome !== undefined
+    : task.status === 'failed' || task.status === 'canceled'
+}
+
+/** One role of the staff directory, in display order. */
+type StaffRole = 'executor' | 'reviewer' | 'initiator'
+
+/** Staff assembly input: session id plus the role it plays. */
+interface RoleSlot {
+  readonly sessionId: string
+  readonly role: StaffRole
+}
+
+/**
+ * The staff of one task from its three role holders: executor, reviewer,
+ * initiator — deduplicated by session id (the initiator reviewing its own
+ * task appears once, as executor or reviewer), fixed order executor →
+ * reviewer → initiator. The reviewer defaults to the initiator.
+ *
+ * @param initiator - the dispatching session.
+ * @param executor - the worker; may be absent until dispatched.
+ * @param reviewer - the settling session; `undefined` falls back to the initiator.
+ * @returns the role slots in display order.
+ */
+export function staffRoles(
+  initiator: string | undefined,
+  executor: string | undefined,
+  reviewer: string | undefined,
+): readonly RoleSlot[] {
+  const slots: RoleSlot[] = []
+  const seen = new Set<string>()
+  const push = (sessionId: string | undefined, role: StaffRole): void => {
+    if (sessionId === undefined || seen.has(sessionId)) return
+    seen.add(sessionId)
+    slots.push({ sessionId, role })
+  }
+  push(executor, 'executor')
+  push(reviewer ?? initiator, 'reviewer')
+  push(initiator, 'initiator')
+  return slots
+}
+
+/**
+ * The staff of one ledger row (see {@link staffRoles}).
+ *
+ * @param task - the row.
+ * @returns the role slots in display order.
+ */
+export function staffRolesOf(task: TaskRecord): readonly RoleSlot[] {
+  return staffRoles(task.assignedBy, task.assignedTo, task.assignedReviewer)
+}
+
+/**
+ * The task-period token delta for one session: current projection minus the
+ * dispatch-time snapshot, clamped at zero. Either side unavailable → null.
+ *
+ * @param projections - the projection registry, or `undefined` when absent.
+ * @param agents - the agent registry (live sessions only).
+ * @param task - the row holding the `tokensAtStart` snapshot.
+ * @param sessionId - the staff session.
+ * @returns the delta buckets, or `null` when it cannot be computed.
+ */
+export function tokenDeltaOf(
+  projections: ProjectionRegistryLike | undefined,
+  agents: AgentRegistryLike | undefined,
+  task: TaskRecord,
+  sessionId: string,
+): TokenBuckets | null {
+  const start = task.tokensAtStart?.[sessionId]
+  if (start === undefined) return null
+  const agent = agents?.get(sessionId)
+  const current = agent === undefined ? undefined : projections?.snapshot(agent.session).values.tokenUsage
+  if (!isTokenBuckets(current)) return null
+  const clamp = (a: number, b: number): number => Math.max(0, a - b)
+  return {
+    uncachedInputTokens: clamp(current.uncachedInputTokens, start.uncachedInputTokens),
+    outputTokens: clamp(current.outputTokens, start.outputTokens),
+    cacheReadTokens: clamp(current.cacheReadTokens, start.cacheReadTokens),
+    cacheWriteTokens: clamp(current.cacheWriteTokens, start.cacheWriteTokens),
+  }
+}
+
+/** Sum token buckets; `null` when every input is null (never partial here). */
+function sumTokens(entries: readonly (TokenBuckets | null)[]): TokenBuckets | null {
+  let total: TokenBuckets | null = null
+  for (const entry of entries) {
+    if (entry === null) continue
+    total = total === null
+      ? { ...entry }
+      : {
+        uncachedInputTokens: total.uncachedInputTokens + entry.uncachedInputTokens,
+        outputTokens: total.outputTokens + entry.outputTokens,
+        cacheReadTokens: total.cacheReadTokens + entry.cacheReadTokens,
+        cacheWriteTokens: total.cacheWriteTokens + entry.cacheWriteTokens,
+      }
+  }
+  return total
+}
+
+/**
+ * Build the panel's task view for one row: projection plus zone and staff.
+ * Exported for unit tests with stub dependencies.
+ *
+ * @param task - the ledger row.
+ * @param titles - session id → title.
+ * @param agents - agent registry for live flags and projections.
+ * @param projections - projection registry for token deltas.
+ * @param reports - the two-zone report store (zone detection).
+ * @param now - snapshot clock (ms since epoch).
+ * @returns the projected row.
+ */
+export async function buildTaskView(
+  task: TaskRecord,
+  titles: ReadonlyMap<string, string>,
+  agents: AgentRegistryLike | undefined,
+  projections: ProjectionRegistryLike | undefined,
+  reports: ReportStore,
+  now: number,
+): Promise<TaskView> {
+  const titleOf = (sessionId: string | undefined): string | null =>
+    sessionId === undefined ? null : titles.get(sessionId) ?? fallbackTitle(sessionId)
+  const liveOf = (sessionId: string | undefined): boolean =>
+    sessionId !== undefined && agents?.get(sessionId) !== undefined
+
+  const staff: StaffEntry[] = staffRolesOf(task).map(({ sessionId, role }) => ({
+    sessionId,
+    title: titles.get(sessionId) ?? fallbackTitle(sessionId),
+    role,
+    live: liveOf(sessionId),
+    tokensInTask: tokenDeltaOf(projections, agents, task, sessionId),
+  }))
+
+  return {
+    id: task.id,
+    workspacePath: task.workspacePath,
+    status: task.status,
+    settled: isSettled(task),
+    content: task.content,
+    contentPreview: truncateCodePoints(task.content, 120),
+    mode: task.mode,
+    assignedBy: task.assignedBy,
+    assignedTo: task.assignedTo ?? null,
+    assignedReviewer: task.assignedReviewer ?? null,
+    byTitle: titleOf(task.assignedBy) ?? fallbackTitle(task.assignedBy),
+    toTitle: titleOf(task.assignedTo),
+    reviewerTitle: titleOf(task.assignedReviewer ?? task.assignedBy),
+    retries: task.retries,
+    reason: task.reason ?? null,
+    outcome: task.outcome ?? null,
+    feedback: task.feedback !== undefined ? truncateCodePoints(task.feedback, 200) : null,
+    question: task.question !== undefined ? truncateCodePoints(task.question, 200) : null,
+    reportZone: await detectReportZone(reports, task),
+    hasReportRef: task.reportRef !== undefined,
+    turn: task.turn ?? null,
+    staff,
+    taskTokensTotal: sumTokens(staff.map(entry => entry.tokensInTask)),
+    createdAt: task.createdAt,
+    updatedAt: task.updatedAt,
+    ageMs: Math.max(0, now - Date.parse(task.createdAt)),
+    updatedMs: Math.max(0, now - Date.parse(task.updatedAt)),
+  }
+}
+
+/**
+ * Assemble the full snapshot: workspace directory, session directory, all
+ * tasks, and counters. Any missing service degrades to empty arrays / nulls.
+ *
+ * @param ctx - the plugin context (services read via `ctx.get`).
+ * @param ledger - the task ledger.
+ * @param reports - the two-zone report store.
+ * @param now - snapshot clock (ms since epoch); defaults to the current time.
+ * @returns the snapshot document.
+ */
+export async function buildPanelSnapshot(
+  ctx: Context,
+  ledger: TaskLedger,
+  reports: ReportStore,
+  now: number = Date.now(),
+): Promise<PanelSnapshot> {
+  const registry = ctx.get('workspaceRegistry') as WorkspaceRegistry | undefined
+  const workspaces = registry?.list() ?? []
+  const agents = ctx.get('agents') as AgentRegistryLike | undefined
+  const projections = ctx.get('sessionProjections') as ProjectionRegistryLike | undefined
+  const titles = await readTitlesFile(
+    dshHomePath('storages', 'session_projcache.json'),
+  )
+
+  // Session directory: every workspace's owned sessions, unioned with any
+  // session a task references (a reference outside the registry is offline).
+  const sessionWorkspace = new Map<string, string>()
+  for (const workspace of workspaces) {
+    for (const sessionId of workspace.sessionIds) {
+      sessionWorkspace.set(String(sessionId), String(workspace.id))
+    }
+  }
+  for (const task of ledger.listAll()) {
+    for (const sessionId of [task.assignedBy, task.assignedTo, task.assignedReviewer]) {
+      if (sessionId !== undefined) sessionWorkspace.set(String(sessionId), sessionWorkspace.get(String(sessionId)) ?? '')
+    }
+  }
+  const sessions: SessionView[] = []
+  for (const [sessionId, workspaceId] of sessionWorkspace) {
+    sessions.push({
+      id: sessionId,
+      title: titles.get(sessionId) ?? fallbackTitle(sessionId),
+      workspaceId: workspaceId === '' ? null : workspaceId,
+      live: agents?.get(sessionId) !== undefined,
+    })
+  }
+
+  const tasks: TaskView[] = []
+  const stats = emptyStats()
+  for (const task of ledger.listAll()) {
+    const view = await buildTaskView(task, titles, agents, projections, reports, now)
+    tasks.push(view)
+    stats.total += 1
+    switch (task.status) {
+      case 'submitted':
+      case 'working':
+      case 'input-required':
+      case 'completed':
+      case 'failed':
+      case 'canceled':
+        stats[task.status] += 1
+        break
+      default:
+        break
+    }
+  }
+
+  return {
+    workspaces: workspaces.map(workspace => ({
+      id: String(workspace.id),
+      title: workspace.title,
+      path: workspace.path,
+    })),
+    sessions,
+    tasks,
+    stats,
+  }
+}

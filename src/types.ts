@@ -59,6 +59,18 @@ export type TaskOutcome = 'success' | 'failure'
  */
 export type DeliveryMode = 'followup' | 'steer'
 
+/**
+ * Four-bucket token usage, the same shape as the token-meter projection
+ * (`uncachedInputTokens` / `outputTokens` / `cacheReadTokens` /
+ * `cacheWriteTokens`). Used for task-period consumption deltas.
+ */
+export interface TokenBuckets {
+  readonly uncachedInputTokens: number
+  readonly outputTokens: number
+  readonly cacheReadTokens: number
+  readonly cacheWriteTokens: number
+}
+
 /** One machine-readable capability a peer advertises. */
 export interface Capability {
   /** Machine key: kebab-case, matched by programs and future routing. */
@@ -118,6 +130,12 @@ export interface TaskRecord {
   readonly reason?: string
   /** Rework count: how many times this task has been sent back to the worker. */
   readonly retries: number
+  /**
+   * Dispatch-time token totals per participant session (deduplicated staff),
+   * taken when the task was recorded. Task-period consumption is the current
+   * projection minus this snapshot; absent sessions were offline at dispatch.
+   */
+  readonly tokensAtStart?: Record<string, TokenBuckets>
   /** ISO-8601 creation stamp. */
   readonly createdAt: string
   /** ISO-8601 stamp of the last status change. */
