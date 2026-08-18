@@ -57,6 +57,7 @@ export const taskRecord = z.object({
   messageId: z.string().optional(),
   turn: z.number().int().nonnegative().optional(),
   report: z.string().optional(),
+  reportRef: z.string().optional(),
   question: z.string().optional(),
   outcome: z.enum(['success', 'failure']).optional(),
   feedback: z.string().optional(),
@@ -104,7 +105,7 @@ export type AgentBusDomainState = z.infer<typeof agentBusDomainState>
  */
 export const agentBusDomainSpec = defineDomain({
   name: 'agent_bus',
-  version: 3,
+  version: 4,
   global: {
     schema: agentBusDomainState,
     initial: { taskIds: [] },

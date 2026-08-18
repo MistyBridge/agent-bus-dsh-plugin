@@ -27,10 +27,12 @@
 import type { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 // Declaration merge only: makes ctx.storageDomain and ctx.systemPrompt visible.
+import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import type {} from '@deepseek-ai/dsh-session-title'
 import type {} from '@deepseek-ai/dsh-storage-domain'
 import type {} from '@deepseek-ai/dsh-system-prompt'
 import type {} from '@deepseek-ai/dsh-workspace'
+import { ReportStore } from './external.ts'
 import { TaskLedger } from './ledger.ts'
 import { DispatchRateLimiter } from './rate-limit.ts'
 import { registerAgentBusTools, type ToolsConfig } from './tools.ts'
@@ -58,6 +60,8 @@ export interface Config {
   maxSendsPerMinute?: number
   /** How long a working or input-required task may sit before failing (default `7200000`, 2 hours). */
   taskTimeoutMs?: number
+  /** Reports longer than this are externalized to the report store (default `400`). */
+  maxInlineReport?: number
   /** Prompt-section order for the usage policy (default `118`). */
   promptSectionOrder?: number
 }
@@ -67,6 +71,7 @@ export const Config: z<Config> = z.object({
   maxPendingPerAgent: z.natural().min(1).default(20),
   maxSendsPerMinute: z.natural().min(1).default(10),
   taskTimeoutMs: z.natural().min(60_000).default(7_200_000),
+  maxInlineReport: z.natural().min(1).default(400),
   promptSectionOrder: z.natural().default(118),
 })
 
@@ -105,6 +110,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     maxContentLength: config.maxContentLength ?? 16000,
     maxPendingPerAgent: config.maxPendingPerAgent ?? 20,
     maxSendsPerMinute: config.maxSendsPerMinute ?? 10,
+    maxInlineReport: config.maxInlineReport ?? 400,
   }
 
   ctx.systemPrompt.section({
@@ -115,7 +121,16 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   const ledger = await TaskLedger.open(ctx)
   const limiter = new DispatchRateLimiter(resolved.maxSendsPerMinute, 60_000)
-  registerAgentBusTools(ctx, resolved, { ledger, workspaces: ctx.workspaceRegistry, limiter })
+  const reports = new ReportStore(
+    dshHomePath('agent-bus', 'cache'),
+    dshHomePath('agent-bus', 'archive'),
+  )
+  registerAgentBusTools(ctx, resolved, {
+    ledger,
+    workspaces: ctx.workspaceRegistry,
+    limiter,
+    reports,
+  })
 
   // Ledger state follows the real inbox lifecycle. The events are scope-filtered
   // per agent; a listener on the host context admits them from every agent.
@@ -137,7 +152,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   // Timeout sweep: a working row whose claimed step was rejected neither
   // reports nor discards, so only time can close it. An unanswered
-  // input-required row is the same shape on the dispatcher's side.
+  // input-required row is the same shape on the dispatcher's side. A timed
+  // out task is terminal, so its report moves hot -> cold.
   const timeoutMs = config.taskTimeoutMs ?? 7_200_000
   const timer = setInterval(() => {
     const cutoff = Date.now() - timeoutMs
@@ -145,9 +161,19 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (row.status !== 'working' && row.status !== 'input-required') continue
       if (Date.parse(row.updatedAt) > cutoff) continue
       const reason = row.status === 'working' ? 'timeout' : 'no-response'
-      void ledger.transition(row.id, 'failed', { reason })
+      void ledger.transition(row.id, 'failed', { reason }).then(() => {
+        void reports.archive(row.id)
+      })
     }
   }, Math.min(timeoutMs / 2, 600_000))
   timer.unref?.()
   ctx.effect(() => () => clearInterval(timer), 'agent-bus.timeoutSweep')
+
+  // Report-store sweep: hot files idle past 7 days and cold files idle past
+  // 30 days are removed. Runs hourly; unref'd so it never holds the process.
+  const cacheSweep = setInterval(() => {
+    void reports.sweep()
+  }, 3_600_000)
+  cacheSweep.unref?.()
+  ctx.effect(() => () => clearInterval(cacheSweep), 'agent-bus.cacheSweep')
 }

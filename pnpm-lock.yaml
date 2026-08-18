@@ -33,6 +33,9 @@ importers:
       '@deepseek-ai/dsh-client-ui-tool':
         specifier: link:..\deepseek-harness-master\packages\client\ui-tool
         version: link:../deepseek-harness-master/packages/client/ui-tool
+      '@deepseek-ai/dsh-home-paths':
+        specifier: link:..\deepseek-harness-master\packages\util\home-paths
+        version: link:../deepseek-harness-master/packages/util/home-paths
       '@deepseek-ai/dsh-llm':
         specifier: link:../deepseek-harness-master/packages/llm/llm
         version: link:../deepseek-harness-master/packages/llm/llm

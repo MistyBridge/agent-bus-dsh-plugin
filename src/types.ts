@@ -104,8 +104,10 @@ export interface TaskRecord {
   readonly messageId?: string
   /** Turn that claimed the latest delivery, present from `working` onward. */
   readonly turn?: number
-  /** Worker's report (the artifact) of the latest attempt. */
+  /** Worker's report (the artifact) of the latest attempt; when externalized, an inline summary. */
   readonly report?: string
+  /** Reference into the report store when the full report lives on disk. */
+  readonly reportRef?: string
   /** The question the worker asked, present while `input-required`. */
   readonly question?: string
   /** Latest verdict: success is terminal; failure returns the row to `submitted` for rework. */

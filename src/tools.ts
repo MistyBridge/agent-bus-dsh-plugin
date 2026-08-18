@@ -23,6 +23,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
 import { authorizePeer, authorizeSettlement, resolveWorkspacePath } from './authorize.ts'
 import { admitContent, buildTaskMessage, deliverTask } from './delivery.ts'
+import type { ReportStore } from './external.ts'
 import type { TaskLedger } from './ledger.ts'
 import { DispatchRateLimiter } from './rate-limit.ts'
 import { TaskId, type DeliveryMode, type TaskRecord } from './types.ts'
@@ -32,6 +33,8 @@ export interface ToolsConfig {
   readonly maxContentLength: number
   readonly maxPendingPerAgent: number
   readonly maxSendsPerMinute: number
+  /** Reports longer than this are externalized to the report store (default `400`). */
+  readonly maxInlineReport: number
 }
 
 /** Services the tool bodies need beyond `ctx`. */
@@ -39,6 +42,7 @@ export interface ToolsDeps {
   readonly ledger: TaskLedger
   readonly workspaces: WorkspaceRegistry
   readonly limiter: DispatchRateLimiter
+  readonly reports: ReportStore
 }
 
 /** Model-facing projection of one ledger row for listings. */
@@ -546,7 +550,15 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       if (!canReadTask(task, callerId, callerWorkspace)) {
         throw new Error(`session "${callerId}" is outside task "${taskId}"'s workspace`)
       }
-      return detailView(task)
+      // Externalized reports are read back so the reviewer sees the full
+      // result; a missing file degrades to the inline summary.
+      let fullReport: string | undefined
+      if (task.reportRef !== undefined) {
+        fullReport = await deps.reports.read(task.reportRef)
+      }
+      return fullReport !== undefined
+        ? { ...detailView(task), report: fullReport }
+        : detailView(task)
     },
   }))
 
@@ -593,7 +605,18 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         if (!attached.ok) throw new Error(attached.message)
         return { taskId, status: attached.task.status }
       }
-      const completed = await ledger.transition(taskId, 'completed', { report: admitted.content })
+      // Long reports are externalized: the ledger row carries a bounded
+      // summary plus the reference, and get_task reads the full text back.
+      let report = admitted.content
+      let reportRef: string | undefined
+      if (report.length > config.maxInlineReport) {
+        reportRef = await deps.reports.save(taskId, admitted.content)
+        report = `${admitted.content.slice(0, config.maxInlineReport)}…`
+      }
+      const completed = await ledger.transition(taskId, 'completed', {
+        report,
+        ...(reportRef !== undefined ? { reportRef } : {}),
+      })
       if (!completed.ok) throw new Error(completed.message)
       // The reviewer is woken to settle; default reviewer is the initiator.
       const reviewer = task.assignedReviewer ?? task.assignedBy
@@ -651,6 +674,8 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       const outcome = args.outcome === 'failure' ? 'failure' : 'success'
       const settled = await ledger.settle(taskId, outcome, args.feedback)
       if (!settled.ok) throw new Error(settled.message)
+      // A settled task is terminal: its report moves hot -> cold.
+      await deps.reports.archive(taskId)
       if (outcome === 'success') {
         // Result returns to the initiator: the loop closes.
         notifySession(ctx, task.assignedBy, taskId,
@@ -713,6 +738,8 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         ...(reason?.ok === true ? { reason: reason.content } : {}),
       })
       if (!canceled.ok) throw new Error(canceled.message)
+      // A canceled task is terminal: its report moves hot -> cold.
+      await deps.reports.archive(taskId)
 
       // Interrupt the worker's in-flight turn, then ask for the summary. Both
       // are best-effort: an absent worker keeps the canceled row and the
