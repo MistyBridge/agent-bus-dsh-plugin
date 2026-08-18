@@ -35,7 +35,7 @@ import type {} from '@deepseek-ai/dsh-workspace'
 import { ReportStore } from './external.ts'
 import { TaskLedger } from './ledger.ts'
 import { DispatchRateLimiter } from './rate-limit.ts'
-import { registerAgentBusTools, type ToolsConfig } from './tools.ts'
+import { notifySession, registerAgentBusTools, type ToolsConfig } from './tools.ts'
 
 export const name = 'agent-bus'
 
@@ -85,6 +85,7 @@ const USAGE_TEXT = `You share a workspace with other agent sessions and can disp
 - report_task is the worker's way to finish: a working task becomes completed and the reviewer is notified to settle it. If the task was canceled, report_task attaches your work summary instead.
 - settle_task is the reviewer's verdict: success accepts and the task is done; failure sends the SAME task back to the worker for rework with your feedback as the instruction — the task id never changes across attempts, and the worker is notified automatically. The initiator is notified of the final result.
 - When you receive a notice that a task you review is completed, settle it promptly; leaving it unsettled stalls the worker.
+- When you receive a notice that a task you initiated timed out, decide whether to redo it with a new dispatch_task; a timeout means the worker never finished or never answered.
 - cancel_task is the initiator's way to stop a task that is still submitted, working, or awaiting input. The worker is interrupted and asked for a summary, which lands on the canceled task.
 - request_input pauses a task you are working on when you need information only the initiator has; they answer with dispatch_task passing task_id.
 - update_card maintains your own capability card: a description for other agents and machine-readable capabilities for routing.
@@ -153,7 +154,9 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // Timeout sweep: a working row whose claimed step was rejected neither
   // reports nor discards, so only time can close it. An unanswered
   // input-required row is the same shape on the dispatcher's side. A timed
-  // out task is terminal, so its report moves hot -> cold.
+  // out task is terminal: its report moves hot -> cold and the INITIATOR is
+  // notified — a timeout means a side of the loop went quiet, and the
+  // initiator is the one who can decide to redo it.
   const timeoutMs = config.taskTimeoutMs ?? 7_200_000
   const timer = setInterval(() => {
     const cutoff = Date.now() - timeoutMs
@@ -163,6 +166,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       const reason = row.status === 'working' ? 'timeout' : 'no-response'
       void ledger.transition(row.id, 'failed', { reason }).then(() => {
         void reports.archive(row.id)
+        notifySession(ctx, row.assignedBy, row.id,
+          `任务 ${row.id} 已超时失败(failed, reason: ${reason})。执行方未在时限内完成或回答。如需重做,请派发新任务。`)
       })
     }
   }, Math.min(timeoutMs / 2, 600_000))

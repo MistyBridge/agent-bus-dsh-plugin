@@ -208,7 +208,7 @@ function requireCaller(agent: { id: SessionId } | undefined, tool: string): Sess
  * @param taskId - the task the notice concerns.
  * @param text - the notice body.
  */
-function notifySession(ctx: Context, sessionId: SessionId, taskId: TaskId, text: string): void {
+export function notifySession(ctx: Context, sessionId: SessionId, taskId: TaskId, text: string): void {
   const session = ctx.agents.get(sessionId)
   if (session === undefined) return
   const notice = buildTaskMessage(sessionId, taskId, text)
