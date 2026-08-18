@@ -89,6 +89,8 @@ export interface TaskView {
   readonly turn: number | null
   readonly staff: readonly StaffEntry[]
   readonly taskTokensTotal: TokenBuckets | null
+  /** Whether the executor (assignedTo) is live; the authoritative tab-partition key. */
+  readonly executorLive: boolean
   readonly createdAt: string
   readonly updatedAt: string
   readonly ageMs: number
@@ -329,11 +331,59 @@ export async function buildTaskView(
     turn: task.turn ?? null,
     staff,
     taskTokensTotal: sumTokens(staff.map(entry => entry.tokensInTask)),
+    executorLive: task.assignedTo !== undefined && agents?.get(task.assignedTo) !== undefined,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     ageMs: Math.max(0, now - Date.parse(task.createdAt)),
     updatedMs: Math.max(0, now - Date.parse(task.updatedAt)),
   }
+}
+
+/**
+ * The panel's session directory, same source as the harness sidebar.
+ *
+ * The sidebar lists live sessions plus persisted cold ones whose log carries
+ * a cwd (see the host `session.list` implementation), and it never lists
+ * subagent sessions — they are not conversation peers. The panel mirrors
+ * that: live sessions from the session store, cold sessions from the
+ * persistence store, subagents excluded by header origin everywhere.
+ *
+ * @param ctx - plugin context; both stores are optional at runtime.
+ * @param registryIds - session ids the workspace registry accounts for, used
+ *   only as a fallback when the session store is absent (degraded mode).
+ * @returns the authoritative set of visible session ids.
+ */
+async function visibleSessionIds(
+  ctx: Context,
+  registryIds: readonly string[],
+): Promise<Set<string>> {
+  const sessionStore = ctx.get('sessions') as { list(): { id: string; header: { origin?: string } }[] } | undefined
+  const ids = new Set<string>()
+  if (sessionStore !== undefined) {
+    for (const session of sessionStore.list()) {
+      if (session.header.origin === 'subagent') continue
+      ids.add(session.id)
+    }
+  } else {
+    // Degraded: no session store — fall back to the registry account so a
+    // webless or partial profile still gets a directory.
+    for (const id of registryIds) ids.add(id)
+  }
+  const persistence = ctx.get('sessionPersistence') as
+    | { list(): Promise<{ id: string; cwd?: string; origin?: string }[]> }
+    | undefined
+  if (persistence !== undefined) {
+    try {
+      for (const meta of await persistence.list()) {
+        if (meta.cwd === undefined) continue
+        if (meta.origin === 'subagent') continue
+        ids.add(meta.id)
+      }
+    } catch {
+      // Degrade to the store/registry set; the directory is a display concern.
+    }
+  }
+  return ids
 }
 
 /**
@@ -359,14 +409,38 @@ export async function buildPanelSnapshot(
   const titles = await readTitlesFile(
     dshHomePath('storages', 'session_projcache.json'),
   )
+  // Live sessions: the title MUST match what the harness sidebar shows. The
+  // sidebar reads the session-title projection ('title'), so the same
+  // projection value overrides the disk cache for every live session; the
+  // projection may legitimately be absent (title not generated yet), in which
+  // case the disk value — or the id-prefix fallback — stands.
+  const sessionStore = ctx.get('sessions') as { list(): { id: string; header: { origin?: string } }[] } | undefined
+  if (agents !== undefined && projections !== undefined) {
+    for (const session of sessionStore?.list() ?? []) {
+      if (session.header.origin === 'subagent') continue
+      const agent = agents.get(session.id)
+      if (agent === undefined) continue
+      const title = projections.snapshot(agent.session).values.title
+      if (typeof title === 'string' && title !== '') titles.set(session.id, title)
+    }
+  }
 
-  // Session directory: every workspace's owned sessions, unioned with any
-  // session a task references (a reference outside the registry is offline).
-  const sessionWorkspace = new Map<string, string>()
+  // Session directory: every visible session (sidebar same-source), mapped to
+  // its owning workspace through the registry account, plus any session a
+  // task references that is no longer visible (an offline reference).
+  const registrySessionWorkspace = new Map<string, string>()
   for (const workspace of workspaces) {
     for (const sessionId of workspace.sessionIds) {
-      sessionWorkspace.set(String(sessionId), String(workspace.id))
+      registrySessionWorkspace.set(String(sessionId), String(workspace.id))
     }
+  }
+  const visible = await visibleSessionIds(
+    ctx,
+    [...registrySessionWorkspace.keys()],
+  )
+  const sessionWorkspace = new Map<string, string>()
+  for (const sessionId of visible) {
+    sessionWorkspace.set(sessionId, registrySessionWorkspace.get(sessionId) ?? '')
   }
   for (const task of ledger.listAll()) {
     for (const sessionId of [task.assignedBy, task.assignedTo, task.assignedReviewer]) {

@@ -10,12 +10,14 @@
  * @module dsh-agent-bus/client
  */
 
+import { createRoot } from 'react-dom/client'
 import type { ClientContext } from '@deepseek-ai/dsh-client-runtime/client'
 import type {} from '@deepseek-ai/dsh-client-ui-tool/client'
 import { AgentBusToolRow } from './AgentBusToolRow.tsx'
+import { TaskPanel } from './TaskPanel.tsx'
 
-/** Required services: the slot registry that owns the tool view seat. */
-export const inject = ['slots']
+/** Required services: slot registry plus the session list used for current-session highlight. */
+export const inject = ['slots', 'sessions']
 
 /** Every model-facing tool this plugin renders in collapsed form. */
 const AGENT_BUS_TOOLS = [
@@ -40,4 +42,11 @@ export function apply(ctx: ClientContext): void {
     ctx.slots.inject('tool.call.toolview', () =>
       ctx.slots.register({ name: 'tool.call.toolview', key: tool }, AgentBusToolRow))
   }
+
+  const host = document.createElement('div')
+  host.dataset.agentBusPanelHost = ''
+  document.body.appendChild(host)
+  const root = createRoot(host)
+  root.render(<TaskPanel sessionsList={ctx.sessions.list} />)
+  ctx.effect(() => () => { root.unmount(); host.remove() }, 'agent-bus: task panel')
 }
