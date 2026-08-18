@@ -38,6 +38,14 @@
 - 可视化面板(Web UI):`domain/changed` 仅进程内;client bundle 需复刻 `tsdown.client.ts` 协议(参考 dsh-agent-teams 的复刻)。
 - 离线投递 / DAG:见上。
 
+## 冷热分区报告存储(2026-08-18 已实现)
+
+- **用户要求**:自己规划冷热数据分区,划分归档区。
+- **设计**:`~/.dsh/agent-bus/cache/`(热区,活跃任务报告,7 天未访问清理)+ `archive/`(冷区,终态任务报告,30 天未访问清理)。
+- **流转**:报告 > `maxInlineReport`(默认 400)外置热区,台账存截断摘要 + `reportRef`(= taskId,永不暴露路径);settle/cancel/超时扫查使任务进入终态时报告**移动**热→冷(reference 不变,台账无需更新);`get_task` 先热后冷读回全文,模型无感知。
+- **评估结论**:dsh 的 spill seam 不契合——它面向工具结果一次性溢出(模型拿 locator 自己 read),无任务级寻址与清理;自建 ReportStore(两区 + sweep)。
+- 单测 5 项(含两区 sweep)+ 冷热 e2e ALL PASS;domain v4。
+
 ## UI 折叠渲染(2026-08-18 已实现)
 
 - **用户要求**:状态机全部工具调用不在前端显式显示为「Tool call: xxx」行,而是像「上下文注入」一样折叠(标题 `agent-bus-task`,参数收在折叠栏内)。
