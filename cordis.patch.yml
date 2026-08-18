@@ -1,0 +1,36 @@
+# dsh-agent-bus bundle patch: mounts the agent-bus plugin into the host
+# composition of a dsh profile. The plugin registers its four tools into the
+# shared `tools` registry and one usage section into the global system prompt,
+# so every session of the profile can dispatch work to workspace peers.
+#
+# Install: `dsh plugin --profile <name> add <this package>` (npm or a local
+# path). The `dsh plugin` command pnpm-installs the package into the profile
+# and reconciles it into the profile's `dsh.profile.bundles` layer list.
+#
+# The storage rows are deliberately NOT inserted here. `insert` appends rows
+# and does not merge by id, so restating the rows a profile already carries
+# (the web-app bundle mounts storage, storage-json, and storage-domain) mounts
+# each plugin twice and makes two instances contend for one service key.
+# The plugin declares `storageDomain` and `workspaceRegistry` in its inject
+# list instead, so a profile that mounts them (web-app does) activates the
+# ledger, and a profile that does not fails loud at load — a gateway that
+# could record nothing must not boot as a silent prompt-only stub. A profile
+# that wants the ledger without web-app supplies the three storage rows plus
+# the workspace row in its own `cordis.patch.yml`.
+- insert:
+    # Node-resolvable package name — must stay in sync with package.json `name`.
+    - id: agent-bus
+      name: 'dsh-agent-bus'
+      config:
+        # Character ceiling on relayed content; over-length content is refused
+        # rather than truncated, so a sender learns to split the work.
+        maxContentLength: 16000
+        # Unfinished tasks one recipient may hold before dispatch is refused.
+        # The harness inbox has no depth limit of its own.
+        maxPendingPerAgent: 20
+        # Dispatches one sender may issue per minute. In-process sliding
+        # window; clears on restart.
+        maxSendsPerMinute: 10
+        # How long a working or input-required task may sit before failing
+        # (2 hours). The sweep runs at half this interval.
+        taskTimeoutMs: 7200000

@@ -1,0 +1,72 @@
+# dsh-agent-bus 设计笔记
+
+> 记录决策与移植取舍。本文档是活文档:改动设计时同步更新。
+> 基线:dsh 0.1.0-rc.5 · 2026-08-17
+
+## 已定决策
+
+1. **双平面**:投递用 dsh 原生 Inbox(`next-turn` FIFO,一条一 turn,空闲取下一项,item 间有持久化检查点);台账自建,记录意图与结果。台账**不镜像** Inbox——两者按设计漂移(Inbox 是执行权威)。参见 dsh `.agents/notes/implemented/architecture/2026-07-30-followup-enqueue-and-owned-runs.md`。
+2. **状态机四段 + 细分**:待分配 → 待执行 → 执行中 → 已提交 → 完成归档(success/failure)。失败处理与测试环节在台账状态机内,不在节点状态。判定权 = `task.assignedBy === caller`(涌现角色,无 role 字段)。
+3. **工具面 4 个**,无 Router Mode。教训源:CC_BOOS 73 工具被迫做 router 稳定 prompt-cache;要吸取的不是「也做 router」而是「别走到那一步」。
+4. **不扩 SessionEventMap**。`known-event-types.ts` 由仓库根 glob 生成,仓库外插件构造上进不去;`ignorable: true` 契约限定「丢失不影响重建」。所有需存活状态落 storage domain。
+5. **`inject` 声明 `storageDomain` + `workspaceRegistry`**。前者是 provided 值非 Service——`ctx.get()` 查不到,`inject` 能解析(workspace 包同法)。缺失则加载即失败(misconfiguration fails loud),不做静默降级。
+6. **内容消毒**:ANSI CSI / ESC 对 / C0(留 `\t\n\r`)/ C1 剥离 + 长度上限。超限拒绝不截断。
+7. **深度上限 + 速率限制**:dsh Inbox 无深度上限(`append()` 只查 id 重复),台账在 `record()` 前数未完成行;派发按发送者 60s 滑动窗口限流。两者皆 Config 字段。
+
+## 刻意不移植(自 CC_BOOS)
+
+| 模块 | 行数(约) | 不移植原因 |
+|---|---|---|
+| `ptyInjectionQueue.js` + `notificationsWake.js` | 764 | 其四层防护(idle 门/安静窗/burst/自愈重注入)存在的唯一理由是 Claude Code 无程序化收件箱,唤醒要敲 `check_inbox[BOOS]` 进终端。dsh `followup()` 原生把消息变成 turn。 |
+| `transport.js` SSE 会话管理 | ~600 | 同上,服务于 PTY 双通道唤醒与断线回放。 |
+| `inboxStore.js` | 375 | per-uid 文件锁/TOCTOU 修复/写后验证——dsh 的 `Session.append` 是唯一写路径,域写入走域自身写链。 |
+| `routerMode.js` | 79 | 工具面 4 个不需要。 |
+| DAG(15 工具)+ Goal(7)+ 评审提案(9) | ~3500 | 上层编排,不是消息网关;v2 议题,`dependsOn` 字段已预留(无需迁移)。 |
+| 文件锁 3 + 知识库 2 + 约束 2 | — | 另一能力。 |
+| PMO 角色 | — | CC_BOOS 里本就是个半成品(schema enum 无 pmo,registry 却接受),且用户决策去掉。 |
+| 离线 mailbox | — | dsh 已明确否决(`2026-07-30-continuable-subagent-report-tool.md:89`);需要正式的 proposed note supersede 才能做。 |
+
+## 移植时发现的 CC_BOOS 缺陷(我们避免重犯)
+
+- `auth.requireSameWorkspace` 导出但从未被调用,工作区检查每处手写 → `dag_status` 等三个工具完全无门。我们的可达性判定只有 `authorize.ts` 一个函数。
+- `message_type=response` 路径存在但 schema 里没有该字段,调用方不可发现。我们的工具 schema 与实现一一对应。
+- 若干工具描述与实施不符(以代码为准的教训)。
+
+## 未做(排队)
+
+- 执行中超时扫查:被认领后 step 被拒的消息既不触发 `discarded` 也不执行(`agent/inbox/claimed` JSDoc 明示),台账会永久停在执行中。需定时扫查 + 超时转 failed。
+- 可视化面板(Web UI):`domain/changed` 仅进程内;client bundle 需复刻 `tsdown.client.ts` 协议(参考 dsh-agent-teams 的复刻)。
+- 离线投递 / DAG:见上。
+
+## UI 折叠渲染(2026-08-18 已实现)
+
+- **用户要求**:状态机全部工具调用不在前端显式显示为「Tool call: xxx」行,而是像「上下文注入」一样折叠(标题 `agent-bus-task`,参数收在折叠栏内)。
+- **关键调查结论**:前端 `toolRowModel`(ui-tool/tool-call-model.ts)**不消费 `presentCall` 的 callView**——「Tool call: 工具名」是静态组合。正确通道是 keyed `tool.call.toolview` slot:按工具名注册即**整体替换**通用工具行(ui-tool/apply.ts 注释明示)。
+- **实现**:
+  - 服务端:9 工具全部加 `presentCall`/`presentResult`(generic 卡片,title 语义化,rawInput 只放关键参数)。
+  - client 半边:`src/client/` 入口注册 9 个 keyed toolview + `AgentBusToolRow`(复用 `DisclosureRow`,一行「agent-bus-task」+ 动作摘要,展开显示完整参数 JSON)。
+  - 构建:双 tsconfig(host exclude src/client)+ tsdown 闭包 bundle(lib/client.js 4.25kB,externals = PLATFORM_MODULES 冻结表 + 纯度门),`dsh.client` 声明 + `exports["./client"]`。
+- **验证**:`/plugins/dsh-agent-bus/client.js` 200;新工具调用全部渲染为折叠行,零 console 错误。
+
+## 已实现
+
+**2026-08-17(端到端验证)**
+- 事件驱动迁移:`agent/inbox/claimed` / `agent/inbox/discarded` → 台账转移。无标签的根上下文监听器被 scope 过滤器全局准入(`scopeTarget` 的 `tag === undefined → return true`),无需 per-agent 注册。
+- 投递竞态修复:`followup()` 对空闲接收者同 tick 认领,先写 messageId 再投递(delivery.ts 拆分 build/deliver)。
+- 输出校验修复:工具返回对象省略 undefined 键(dsh 拒绝非 lossless JSON)。
+- cwd 失效容忍:resolveWorkspacePath 捕获 ENOENT,视为无工作区。
+
+**2026-08-18(A2A 对齐重写,`docs/a2a-alignment.md` 为确认版设计)**
+- 状态机:八个 A2A TaskState 原词(submitted/working/input-required/auth-required/completed/failed/canceled/rejected),零自造状态;扩展语义压字段(reason/question/outcome/supersedes)。判定不改状态,重做 = 新任务(supersedes),无自动重投。
+- 工具面 9 个:A2A 操作名(send_message/list_tasks/get_task/cancel_task)+ 拆分 report_task/settle_task + 新增 request_input/update_card/list_peers。
+- Agent Card:description(模型)+ capabilities(机器,规范化 kebab-case id ≤8 项),domain peers 表,自维护覆盖式。
+- 超时扫查:taskTimeoutMs 默认 2h,working→failed(timeout)、input-required→failed(no-response)。
+- cancel 流程:取消→打断→要求摘要(report_task 对 canceled 只追加字段)。
+- 修两个上线时被 dsh 拒绝的 schema 问题:参数 DSL 不支持 `maxItems`;工具返回含未声明字段(updatedAt)被 additionalProperties:false 拒绝——返回面必须精确等于输出 schema。
+- **提交通知回环(用户指出的断链)**:report_task 置 completed 后对验收方 followup 唤醒,附任务 id + 200 字摘要;验收方自主 settle。防环:settle 是工具调用不产生消息,单向无循环;离线静默跳过。已用「派发后零指令、台账出现 outcome」证明闭环。
+- **三方模型 + 回退重做(用户要求,推翻 supersedes)**:
+  - `assignedReviewer` 字段:dispatch_task 可指定 reviewer,缺省 = 发起方;settle_task 鉴权改为 reviewer。
+  - 状态机:`completed → submitted` 回退转移;settle failure 使**同一任务**回退 submitted、retries+1、feedback 即修改意见、清 report/turn;success 保持 completed 终态。`supersedes` 字段移除——重做不再发新任务,全生命周期停留同一 taskId。
+  - 三条回环:report→通知 reviewer;settle success→通知发起方(结果回传);settle failure→记录新消息 messageId 后通知执行方重做(claimed 监听器据此转移 working——不先记 messageId 则执行方收不到重做驱动,曾为此踩坑)。
+  - 验证:同一任务 id 完成→failure 回退→自动重做→success,retries=1,台账全生命周期连续。
+- domain 版本升 v3(assignedReviewer + 回退,旧数据拒绝)。
