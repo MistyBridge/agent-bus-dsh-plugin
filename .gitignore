@@ -2,3 +2,7 @@ node_modules/
 lib/
 *.log
 .DS_Store
+
+# 本地测试资产,不推送
+# (e2e 依赖本机 dsh 会话与路径;vitest 单测在本地工作区运行)
+tests/
