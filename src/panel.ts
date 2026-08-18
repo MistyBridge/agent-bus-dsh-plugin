@@ -340,47 +340,22 @@ export async function buildTaskView(
 }
 
 /**
- * The panel's session directory, same source as the harness sidebar.
+ * The panel's session directory: live non-subagent sessions only, plus any
+ * session a task references (added by the caller). Persisted-but-disposed
+ * sessions are deliberately excluded — the harness sidebar's visibility is a
+ * client-side property this host can not faithfully mirror, and a task panel
+ * has no use for sessions that own no work.
  *
- * The sidebar lists live sessions plus persisted cold ones whose log carries
- * a cwd (see the host `session.list` implementation), and it never lists
- * subagent sessions — they are not conversation peers. The panel mirrors
- * that: live sessions from the session store, cold sessions from the
- * persistence store, subagents excluded by header origin everywhere.
- *
- * @param ctx - plugin context; both stores are optional at runtime.
- * @param registryIds - session ids the workspace registry accounts for, used
- *   only as a fallback when the session store is absent (degraded mode).
+ * @param ctx - plugin context; the session store is optional at runtime.
  * @returns the authoritative set of visible session ids.
  */
-async function visibleSessionIds(
-  ctx: Context,
-  registryIds: readonly string[],
-): Promise<Set<string>> {
+function visibleSessionIds(ctx: Context): Set<string> {
   const sessionStore = ctx.get('sessions') as { list(): { id: string; header: { origin?: string } }[] } | undefined
   const ids = new Set<string>()
   if (sessionStore !== undefined) {
     for (const session of sessionStore.list()) {
       if (session.header.origin === 'subagent') continue
       ids.add(session.id)
-    }
-  } else {
-    // Degraded: no session store — fall back to the registry account so a
-    // webless or partial profile still gets a directory.
-    for (const id of registryIds) ids.add(id)
-  }
-  const persistence = ctx.get('sessionPersistence') as
-    | { list(): Promise<{ id: string; cwd?: string; origin?: string }[]> }
-    | undefined
-  if (persistence !== undefined) {
-    try {
-      for (const meta of await persistence.list()) {
-        if (meta.cwd === undefined) continue
-        if (meta.origin === 'subagent') continue
-        ids.add(meta.id)
-      }
-    } catch {
-      // Degrade to the store/registry set; the directory is a display concern.
     }
   }
   return ids
@@ -434,10 +409,7 @@ export async function buildPanelSnapshot(
       registrySessionWorkspace.set(String(sessionId), String(workspace.id))
     }
   }
-  const visible = await visibleSessionIds(
-    ctx,
-    [...registrySessionWorkspace.keys()],
-  )
+  const visible = visibleSessionIds(ctx)
   const sessionWorkspace = new Map<string, string>()
   for (const sessionId of visible) {
     sessionWorkspace.set(sessionId, registrySessionWorkspace.get(sessionId) ?? '')

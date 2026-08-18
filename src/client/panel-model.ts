@@ -469,9 +469,12 @@ export function isArchived(task: TaskView): boolean {
 /**
  * Active tab: in-progress (not settled) plus 已完成 that is not yet archived.
  * Failed / canceled rows go to archive; they are not "进行中" or "已完成".
+ * An offline executor cannot hold active work, so its rows are
+ * archive-bound immediately.
  */
 export function activeTabTasks(tasks: readonly TaskView[]): TaskView[] {
   return tasks.filter(task => {
+    if (!task.executorLive) return false
     if (isArchived(task)) return false
     if (!task.settled) return true
     return task.status === 'completed'
@@ -479,11 +482,13 @@ export function activeTabTasks(tasks: readonly TaskView[]): TaskView[] {
 }
 
 /**
- * Archive tab: host-archived rows, completed-over-24h, and other terminals
- * (failed / canceled) that are not shown as active work.
+ * Archive tab: everything of offline executors, host-archived rows,
+ * completed-over-24h, and other terminals (failed / canceled) that are not
+ * shown as active work.
  */
 export function archiveTabTasks(tasks: readonly TaskView[]): TaskView[] {
-  return tasks.filter(task => !activeTabTasks([task]).some(row => row.id === task.id))
+  return tasks.filter(task =>
+    !task.executorLive || isArchived(task) || (task.settled && task.status !== 'completed'))
 }
 
 /** Active-tab order: in-progress first (oldest update), then 已完成 (newest). */
