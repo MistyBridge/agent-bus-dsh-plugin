@@ -91,11 +91,23 @@ export interface TaskView {
   readonly taskTokensTotal: TokenBuckets | null
   /** Whether the executor (assignedTo) is live; the authoritative tab-partition key. */
   readonly executorLive: boolean
+  /**
+   * Whether the task reached the lifecycle's archive phase: settled and
+   * settled more than {@link ARCHIVE_AGE_MS} ago. Host-derived so the panel
+   * never computes the age client-side.
+   */
+  readonly archived: boolean
   readonly createdAt: string
   readonly updatedAt: string
   readonly ageMs: number
   readonly updatedMs: number
 }
+
+/**
+ * How long a settled task stays in the active tab before the lifecycle's
+ * archive phase takes it over (24 hours).
+ */
+export const ARCHIVE_AGE_MS = 24 * 60 * 60 * 1000
 
 /** Status counters, mirroring the client panel-model keys. */
 export interface PanelStats {
@@ -332,6 +344,7 @@ export async function buildTaskView(
     staff,
     taskTokensTotal: sumTokens(staff.map(entry => entry.tokensInTask)),
     executorLive: task.assignedTo !== undefined && agents?.get(task.assignedTo) !== undefined,
+    archived: isSettled(task) && now - Date.parse(task.updatedAt) >= ARCHIVE_AGE_MS,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     ageMs: Math.max(0, now - Date.parse(task.createdAt)),
@@ -340,21 +353,29 @@ export async function buildTaskView(
 }
 
 /**
- * The panel's session directory: live non-subagent sessions only, plus any
- * session a task references (added by the caller). Persisted-but-disposed
- * sessions are deliberately excluded — the harness sidebar's visibility is a
- * client-side property this host can not faithfully mirror, and a task panel
- * has no use for sessions that own no work.
+ * The panel's session directory: live non-subagent sessions that actually
+ * hold work, plus any session a task references (added by the caller).
+ *
+ * Blank sessions — a seed that ended without a single turn — are excluded,
+ * exactly like the harness sidebar hides them: the session store keeps the
+ * live object, but a session with no user or assistant message is not a
+ * conversation peer. Persisted-but-disposed sessions are likewise excluded.
  *
  * @param ctx - plugin context; the session store is optional at runtime.
  * @returns the authoritative set of visible session ids.
  */
 function visibleSessionIds(ctx: Context): Set<string> {
-  const sessionStore = ctx.get('sessions') as { list(): { id: string; header: { origin?: string } }[] } | undefined
+  const sessionStore = ctx.get('sessions') as
+    | { list(): { id: string; header: { origin?: string }; events: readonly { type: string }[] }[] }
+    | undefined
   const ids = new Set<string>()
   if (sessionStore !== undefined) {
     for (const session of sessionStore.list()) {
       if (session.header.origin === 'subagent') continue
+      const hasTurn = session.events.some(
+        event => event.type === 'user/message' || event.type === 'assistant/message',
+      )
+      if (!hasTurn) continue
       ids.add(session.id)
     }
   }
