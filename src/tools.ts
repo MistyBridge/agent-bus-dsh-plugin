@@ -932,7 +932,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         ctx.emit('agent-bus/settle', taskId)
         // Result returns to the initiator: the loop closes.
         notifySession(ctx, task.assignedBy, taskId,
-          `任务 ${taskId} 已验收通过(success)。最终结果:${settled.task.report ?? '(无)'}`,
+          `任务 ${taskId} 已验收通过,状态「已完成」(success)。最终结果:${settled.task.report ?? '(无)'}`,
           'settle_task')
       } else if (task.assignedTo !== undefined) {
         // Rework loop: the worker is woken to execute the SAME task again.
@@ -941,7 +941,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         // cannot find the task and it never leaves `submitted`.
         const instruction = args.feedback !== undefined ? args.feedback : '请根据验收意见重新执行。'
         const reworkNotice = buildTaskMessage(callerId, taskId,
-          `任务 ${taskId} 未通过验收(failure)。修改意见:${instruction}。请重新执行后调用 report_task 再次提交。`,
+          `任务 ${taskId} 验收未通过,已返回「待执行」等待重新执行(failure)。修改意见:${instruction}。请重新执行后调用 report_task 再次提交。`,
           'settle_task')
         const recorded = await ledger.recordDelivery(taskId, reworkNotice.id)
         if (!recorded.ok) throw new Error(recorded.message)
@@ -1007,7 +1007,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
           // The cancel signal is advisory; a worker that already settled the
           // turn needs no interruption.
         }
-        const note = `任务 ${taskId} 已被派发方取消${reason?.ok === true ? `(${reason.content})` : ''}。`
+        const note = `任务 ${taskId} 状态「已取消」,由派发方取消${reason?.ok === true ? `(${reason.content})` : ''}。`
           + '请用 report_task 提交你已完成部分的摘要。'
         const summary = buildTaskMessage(callerId, taskId, note, 'cancel_task')
         deliverTask(worker, summary, 'followup')

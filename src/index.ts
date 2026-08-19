@@ -232,7 +232,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (Date.now() - last < REMINDER_COOLDOWN_MS) continue
       lastReminder.set(key, Date.now())
       notifySession(ctx, session.id, task.id,
-        `任务 ${task.id} 的当前轮次已结束,但任务仍处于进行中。如果已经完成,请调用 report_task 提交结果;如果还需要继续处理,可以忽略本提醒;如果该任务并不适合由你执行,也请调用 report_task 简述情况,由派发方验收或取消,避免任务长期滞留。`,
+        `任务 ${task.id} 当前状态「进行中」,本轮次已结束。若已完成,请调用 report_task 提交结果(进入「待验收」);若仍需继续处理,可忽略本提醒;若该任务并不适合由你执行,请调用 report_task 简述情况,由派发方验收或取消,避免任务长期滞留。`,
         'reminder')
       break
     }
@@ -269,7 +269,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       void ledger.transition(row.id, 'failed', { reason }).then(() => {
         void reports.archive(row.id)
         notifySession(ctx, row.assignedBy, row.id,
-          `任务 ${row.id} 已超时失败(failed, reason: ${reason})。执行方未在时限内完成或回答。如需重做,请派发新任务。`,
+          `任务 ${row.id} 已超时,状态「失败」(failed, reason: ${reason})。执行方未在时限内完成或回答。如需重做,请派发新任务。`,
           'timeout')
       })
     }

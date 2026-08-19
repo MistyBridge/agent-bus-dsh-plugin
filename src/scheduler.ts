@@ -46,7 +46,7 @@ export async function dispatchOne(ctx: Context, ledger: TaskLedger, id: TaskId):
     ctx,
     task.assignedBy,
     task.id,
-    `任务 ${task.id} 的前置依赖已全部结算,已自动派发给执行方。`,
+    `任务 ${task.id} 的前置依赖已全部结算,已自动派发,状态「待执行」,等待执行方认领。`,
   )
 }
 
