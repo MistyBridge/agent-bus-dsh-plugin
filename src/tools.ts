@@ -94,6 +94,38 @@ function view(task: TaskRecord): TaskView {
  * @param t - the projected row.
  * @returns the text lines for one row.
  */
+/** Settled rows stay in the active listing for this long (mirror of the panel). */
+const ARCHIVE_AGE_MS = 24 * 60 * 60 * 1000
+
+/**
+ * Whether one row is visible to the agent tools — the active set only.
+ *
+ * Archived tasks are invisible to list_tasks by design, using the SAME
+ * archive rule as the panel: a terminal failure/cancel/reject leaves the
+ * listing immediately, and a settled success leaves once the settlement is
+ * more than 24h old (the panel's archive-phase age). Everything the agent
+ * can still act on — submitted, working, awaiting input, and a completed
+ * row awaiting its verdict — stays visible. History lives in the panel and
+ * session logs; get_task still reads an archived row by id for a reference
+ * that reached the agent before archiving.
+ *
+ * @param row - the ledger row.
+ * @param now - current epoch milliseconds.
+ * @returns `true` when the row belongs to the active set.
+ */
+export function isActiveTask(row: TaskRecord, now: number): boolean {
+  if (row.status === 'failed' || row.status === 'canceled' || row.status === 'rejected') {
+    return false
+  }
+  if (row.status === 'completed') {
+    // Awaiting the verdict: still active. Settled: active for the archive
+    // grace period only.
+    if (row.outcome === undefined) return true
+    return now - Date.parse(row.updatedAt) < ARCHIVE_AGE_MS
+  }
+  return true
+}
+
 export function renderTaskRow(t: TaskView): string {
   // A completed row without a verdict reads as 「待验收」 to the model, mirroring
   // the panel badge — a status the reviewer must settle next.
@@ -649,10 +681,13 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
   ctx.tools.register(defineTool({
     name: 'list_tasks',
     description:
-      'List tasks in the ledger. Scope inbox (default) shows tasks addressed to you, in the order you '
-      + 'will work them; scope outbox shows tasks you dispatched and their current state. A completed '
-      + 'task includes its report text, so read it before settling. Pass status to filter to one task '
-      + 'state. Use get_task when a listing truncates a long report.',
+      'List the ACTIVE tasks in the ledger. Scope inbox (default) shows work addressed to you, in the '
+      + 'order you will do it; scope outbox shows what you dispatched and its current state. Archived '
+      + 'tasks are invisible by design: a task leaves the listing once it failed, was canceled, or its '
+      + 'settlement is more than 24 hours old — history lives in the panel and session logs. A completed '
+      + 'task awaiting your verdict is still active and includes its report text, so read it before '
+      + 'settling. Pass status to filter to one task state. Use get_task when a listing truncates a '
+      + 'long report.',
     parameters: {
       scope: {
         type: 'string',
@@ -714,6 +749,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       if (args.status !== undefined) {
         rows = rows.filter(row => row.status === args.status)
       }
+      rows = rows.filter(row => isActiveTask(row, Date.now()))
       return rows.map(view)
     },
   }))
