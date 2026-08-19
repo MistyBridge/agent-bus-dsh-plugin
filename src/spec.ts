@@ -83,6 +83,12 @@ export const taskRecord = z.object({
   acceptanceCriteria: z.string().max(2000).optional(),
   /** Owning flow id (v1.4): dependencies must stay inside the same flow. */
   flowId: z.string().optional(),
+  /** Handoff documents from settled predecessors (v1.4): dispatched with the task. */
+  handoffs: z.array(z.object({
+    fromTask: taskId,
+    document: z.string(),
+    at: z.string(),
+  })).optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
 })
@@ -136,14 +142,15 @@ export type AgentBusDomainState = z.infer<typeof agentBusDomainState>
  * The agent-bus domain spec: a `tasks` table keyed by task id, a `peers`
  * table keyed by session id, a `flows` table keyed by flow id, plus the
  * order singleton. Version 8 adds the flows container (`flows` table,
- * `tasks.flowId`) for the v1.4 flow model. The version bump invalidates the
- * storage unit — keep a backup of `agent_bus.json` first (v1.3 §6), then
- * bump the version stamp once after upgrading; the ledger migrates
+ * `tasks.flowId`) for the v1.4 flow model. Version 9 adds `tasks.handoffs`
+ * (structured predecessor handoff documents). The version bump invalidates
+ * the storage unit — keep a backup of `agent_bus.json` first (v1.3 §6),
+ * then bump the version stamp once after upgrading; the ledger migrates
  * pre-release `submitted` rows without a messageId to `queued` at open.
  */
 export const agentBusDomainSpec = defineDomain({
   name: 'agent_bus',
-  version: 8,
+  version: 9,
   global: {
     schema: agentBusDomainState,
     initial: { taskIds: [] },

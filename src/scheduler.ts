@@ -45,7 +45,15 @@ export async function dispatchOne(ctx: Context, ledger: TaskLedger, id: TaskId):
   if (task.status !== 'queued') return // idempotent: nothing to deliver
   const worker = ctx.agents.get(task.assignedTo)
   if (worker === undefined) return // offline worker: the row stays queued and the sweep retries
-  const message = buildTaskMessage(task.assignedBy, task.id, task.content, 'scheduler')
+  // Handoff documents from settled predecessors ride along: structured
+  // context (values, decisions, caveats) concatenated after the instruction,
+  // so the worker reads the chain's state instead of excavating old reports.
+  const handoffs = ledger.handoffsFor(task.id)
+  const body = handoffs.length > 0
+    ? `${task.content}\n\n【前置任务交接文档】\n${handoffs.map(handoff =>
+      `来自 ${String(handoff.fromTask)}:\n${handoff.document}`).join('\n\n')}`
+    : task.content
+  const message = buildTaskMessage(task.assignedBy, task.id, body, 'scheduler')
   const advanced = await ledger.transition(id, 'submitted')
   if (!advanced.ok) return // raced: another dispatcher already moved it
   await ledger.recordDelivery(task.id, message.id, true)

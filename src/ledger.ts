@@ -34,6 +34,7 @@ import {
   TaskId,
   type DeliveryMode,
   type FlowRecord,
+  type HandoffEntry,
   type PeerCard,
   type TaskOutcome,
   type TaskRecord,
@@ -293,6 +294,7 @@ export class TaskLedger {
         ...row,
         status: 'queued',
         dependencies: row.dependencies !== undefined ? [...row.dependencies] : undefined,
+        handoffs: row.handoffs !== undefined ? [...row.handoffs] : undefined,
       }
       await this.table.put(row.id, migrated)
     }
@@ -668,6 +670,36 @@ export class TaskLedger {
   /** Read one flow. */
   getFlow(id: string): FlowRecord | undefined {
     return this.flows.get(id)
+  }
+
+  /**
+   * Attach one handoff document to a downstream task: a settled
+   * predecessor's executor delivers structured context that dispatch
+   * concatenates into the downstream's delivered content.
+   *
+   * @param id - the DOWNSTREAM task receiving the document.
+   * @param handoff - the predecessor id, document text, and stamp.
+   * @returns the updated row, or a refusal.
+   */
+  async appendHandoff(id: TaskId, handoff: HandoffEntry): Promise<LedgerResult> {
+    return this.enqueue(async () => {
+      const current = this.table.get(id)
+      if (current === undefined) {
+        return { ok: false as const, message: `no such task "${id}"` }
+      }
+      const updated: StoredTaskRecord = {
+        ...current,
+        handoffs: [...(current.handoffs ?? []), handoff],
+        updatedAt: new Date().toISOString(),
+      }
+      await this.table.put(id, updated)
+      return { ok: true as const, task: updated }
+    })
+  }
+
+  /** Handoff documents attached to one task, in arrival order. */
+  handoffsFor(id: TaskId): readonly HandoffEntry[] {
+    return this.table.get(id)?.handoffs ?? []
   }
 
   /**

@@ -111,7 +111,18 @@ export async function authorizePeer(
     return deny('caller-not-live', 'the calling session is not a live agent')
   }
   if (callerId === targetId) {
-    return deny('self-delivery', 'a session cannot send a task to itself')
+    // Self-execution is allowed (a flow may schedule the PM as a worker), but
+    // the caller still needs a workspace to reach itself with. The reviewer
+    // independence rule is enforced at create_task (reviewer must differ from
+    // the executor when target === caller), never here.
+    const workspacePath = await resolveWorkspacePath(registry, caller)
+    if (workspacePath === undefined) {
+      return deny(
+        'caller-has-no-workspace',
+        'the calling session is not inside a registered workspace, so it has no reachable peers',
+      )
+    }
+    return { ok: true, caller, target: caller, workspacePath }
   }
   const callerWorkspace = await resolveWorkspacePath(registry, caller)
   if (callerWorkspace === undefined) {

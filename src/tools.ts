@@ -157,6 +157,7 @@ interface TaskDetailView {
   readonly to?: string
   readonly content: string
   readonly acceptanceCriteria?: string
+  readonly handoffs?: { fromTask: string; document: string; at: string }[]
   readonly report?: string
   readonly question?: string
   readonly outcome?: string
@@ -176,6 +177,13 @@ function detailView(task: TaskRecord): TaskDetailView {
     ...(task.assignedTo !== undefined ? { to: task.assignedTo } : {}),
     content: task.content,
     ...(task.acceptanceCriteria !== undefined ? { acceptanceCriteria: task.acceptanceCriteria } : {}),
+    ...(task.handoffs !== undefined
+      ? { handoffs: task.handoffs.map(handoff => ({
+        fromTask: String(handoff.fromTask),
+        document: handoff.document,
+        at: handoff.at,
+      })) }
+      : {}),
     ...(task.report !== undefined ? { report: task.report } : {}),
     ...(task.question !== undefined ? { question: task.question } : {}),
     ...(task.outcome !== undefined ? { outcome: task.outcome } : {}),
@@ -234,6 +242,12 @@ export function renderTaskDetail(t: TaskDetailView): string {
     t.content,
   ]
   if (t.acceptanceCriteria !== undefined) lines.push('acceptance criteria:', t.acceptanceCriteria)
+  if (t.handoffs !== undefined && t.handoffs.length > 0) {
+    lines.push('handoff documents:')
+    for (const handoff of t.handoffs) {
+      lines.push(`  from ${handoff.fromTask}:`, handoff.document)
+    }
+  }
   if (t.question !== undefined) lines.push('question:', t.question)
   if (t.report !== undefined) lines.push('submitted result:', t.report)
   if (t.outcome !== undefined) lines.push(`verdict: ${t.outcome}`)
@@ -303,6 +317,53 @@ function snapshotTokensAtDispatch(
   return Object.keys(out).length === 0 ? undefined : out
 }
 
+/**
+ * Per-task notice aggregator: several notices for the SAME task within one
+ * short window (settle receipt + scheduler dispatch land together) are
+ * merged into a single long message instead of N queued followups. The
+ * inbox then carries one turn per task instead of a pile-up, which was the
+ * PM's "notification bombing" pain. The window is short (3s) so a notice is
+ * never meaningfully delayed; a missing flush on shutdown only drops a
+ * duplicate-ish notice, never ledger state.
+ */
+const NOTICE_MERGE_MS = 3_000
+
+class NoticeMerger {
+  private readonly pending = new Map<string, {
+    timer: ReturnType<typeof setTimeout>
+    texts: string[]
+    sessionId: SessionId
+    taskId: TaskId
+    tool: DeliverySource
+  }>()
+
+  push(ctx: Context, sessionId: SessionId, taskId: TaskId, text: string, tool: DeliverySource): void {
+    const key = String(taskId)
+    const existing = this.pending.get(key)
+    if (existing !== undefined) {
+      existing.texts.push(text)
+      return
+    }
+    const entry = { texts: [text], sessionId, taskId, tool }
+    const timer = setTimeout(() => this.flush(ctx, key), NOTICE_MERGE_MS)
+    timer.unref?.()
+    this.pending.set(key, { ...entry, timer })
+  }
+
+  private flush(ctx: Context, key: string): void {
+    const entry = this.pending.get(key)
+    this.pending.delete(key)
+    if (entry === undefined) return
+    const session = ctx.agents.get(entry.sessionId)
+    if (session === undefined) return
+    const body = entry.texts.join('\n')
+    const notice = buildTaskMessage(entry.sessionId, entry.taskId, body, entry.tool)
+    deliverTask(session, notice, 'followup')
+  }
+}
+
+const noticeMerger = new NoticeMerger()
+
 export function notifySession(
   ctx: Context,
   sessionId: SessionId,
@@ -310,10 +371,8 @@ export function notifySession(
   text: string,
   tool: DeliverySource = 'create_task',
 ): void {
-  const session = ctx.agents.get(sessionId)
-  if (session === undefined) return
-  const notice = buildTaskMessage(sessionId, taskId, text, tool)
-  deliverTask(session, notice, 'followup')
+  if (ctx.agents.get(sessionId) === undefined) return
+  noticeMerger.push(ctx, sessionId, taskId, text, tool)
 }
 
 /**
@@ -425,14 +484,14 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
     // control), so the peer channel must not collide with it.
     name: 'send_note',
     description:
-      'Send a lightweight note to a live peer in your workspace: a message, a question, a '
-      + 'confirmation, a coordination ping — anything that is NOT work the peer must deliver a '
-      + 'verifiable result for. The note lands in the peer\'s inbox like an ordinary message; '
-      + 'there is NO task record, no acceptance, and nothing to report or settle. The peer simply '
-      + 'replies in prose (with send_note back to you, if it replies at all). Use create_task '
-      + 'instead when the peer must produce a result you will verify — a note channel needs no '
-      + 'lifecycle, and a task channel whose work was really a chat is how tasks get stuck forever '
-      + 'in working.',
+      'SMALL scope: send a lightweight note to a live peer in your workspace — a message, a '
+      + 'question, a confirmation, a coordination ping; anything that is NOT work the peer must '
+      + 'deliver a verifiable result for. The note lands in the peer\'s inbox like an ordinary '
+      + 'message; there is NO task record, no acceptance, and nothing to report or settle. The '
+      + 'peer simply replies in prose (with send_note back to you, if it replies at all). Use '
+      + 'create_task instead when the peer must produce a result you will verify — a note channel '
+      + 'needs no lifecycle, and a task channel whose work was really a chat is how tasks get '
+      + 'stuck forever in working.',
     parameters: {
       target: { type: 'string', required: true, description: 'Session id of the peer, from list_peers.' },
       content: { type: 'string', required: true, description: 'The note text.' },
@@ -479,11 +538,14 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
   ctx.tools.register(defineTool({
     name: 'create_flow',
     description:
-      'Create a flow: a named DAG container that groups related tasks into one dependency graph. '
-      + 'Create tasks with flow_id to join it; every dependency of a task must live in the same flow '
-      + '(add the task to the flow first with edit_task flow_id), so one flow is always one DAG and '
-      + 'cross-flow references are impossible. The DAG view renders per flow; a flow whose tasks are '
-      + 'all archived moves to the archived section automatically.',
+      'LARGE scope: create a flow — the roadmap container for a multi-step effort. FIRST write out '
+      + 'the full plan (what must happen, in what order, by whom, what "done" means for each step), '
+      + 'THEN create the flow, then split the plan into tasks created with flow_id and dependencies '
+      + 'so the DAG auto-schedules: each task delivers only after its predecessors settle, and a '
+      + 'failure propagates down the chain automatically. Every dependency of a task must live in '
+      + 'the same flow (add the task to the flow first with edit_task flow_id), so one flow is '
+      + 'always one DAG and cross-flow references are impossible. The DAG view renders per flow; a '
+      + 'flow whose tasks are all archived moves to the archived section automatically.',
     parameters: {
       name: { type: 'string', required: true, description: 'Flow display name, 1–80 characters.' },
       description: { type: 'string', description: 'Optional note about the flow.' },
@@ -526,6 +588,64 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         callerId, workspacePath,
       )
       return { flowId: flow.id, name: flow.name }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'submit_handoff',
+    description:
+      'As the executor of a settled task, deliver the handoff document to ONE task that depends on '
+      + 'it (a task listing this one in its dependencies). The document is attached to the '
+      + 'downstream task and is concatenated into its delivered content when it dispatches — this '
+      + 'is how a chain passes structured context (computed values, decisions, caveats) instead of '
+      + 'free-text archaeology. Call it once per downstream task.',
+    parameters: {
+      task_id: { type: 'string', required: true, description: 'The task you executed and completed (its id).' },
+      to_task_id: { type: 'string', required: true, description: 'The downstream task that depends on task_id.' },
+      document: { type: 'string', required: true, description: 'The handoff content the downstream task needs.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          taskId: { type: 'string', required: true },
+          handoffCount: { type: 'number', required: true },
+        },
+      },
+      render: (_args, result) => [{
+        type: 'text',
+        text: `handoff attached to ${result.taskId} (${String(result.handoffCount)} total)`,
+      }],
+    },
+    presentCall: (args) => ({ card: 'generic', title: 'agent-bus:提交交接文档', kind: 'other', rawInput: { task_id: args.task_id, to_task_id: args.to_task_id } }),
+    presentResult: (_args, result) => ({ card: 'generic', title: 'agent-bus:提交交接文档', rawInput: result }),
+    async execute(args, exec) {
+      const callerId = requireCaller(exec.agent, 'submit_handoff')
+      const taskId = TaskId(args.task_id)
+      const toTaskId = TaskId(args.to_task_id)
+      const task = ledger.get(taskId)
+      if (task === undefined) throw new Error(`no such task "${taskId}"`)
+      if (task.assignedTo !== callerId) {
+        throw new Error(`task "${taskId}" is not assigned to you`)
+      }
+      const downstream = ledger.get(toTaskId)
+      if (downstream === undefined) throw new Error(`no such task "${toTaskId}"`)
+      if (!(downstream.dependencies ?? []).includes(taskId)) {
+        throw new Error(`task "${toTaskId}" does not depend on "${taskId}"; handoffs go to downstream tasks only`)
+      }
+      const admitted = admitContent(args.document, config.maxContentLength)
+      if (!admitted.ok) throw new Error(admitted.message)
+      const attached = await ledger.appendHandoff(toTaskId, {
+        fromTask: taskId,
+        document: admitted.content,
+        at: new Date().toISOString(),
+      })
+      if (!attached.ok) throw new Error(attached.message)
+      return {
+        taskId: String(toTaskId),
+        handoffCount: (attached.task.handoffs ?? []).length,
+      }
     },
   }))
 
@@ -591,16 +711,18 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
   ctx.tools.register(defineTool({
     name: 'create_task',
     description:
-      'Create one task node for a live peer in your workspace. The task is recorded in the ledger; a '
-      + 'task whose dependencies are already settled is delivered to the peer\'s queue in one step, and '
-      + 'a task with unsettled dependencies is created as 待投递(queued) and delivered automatically by '
-      + 'the scheduler once every dependency settles — no pacing needed. The peer works delivered tasks '
+      'MEDIUM scope: create one task node for a live peer in your workspace — a single deliverable '
+      + 'the peer must produce and you will review. The task is recorded in the ledger; a task whose '
+      + 'dependencies are already settled is delivered to the peer\'s queue in one step, and a task '
+      + 'with unsettled dependencies is created as 待投递(queued) and delivered automatically by the '
+      + 'scheduler once every dependency settles — no pacing needed. The peer works delivered tasks '
       + 'one at a time, each as its own turn. You become the task\'s initiator. By default you also '
       + 'review its result; pass reviewer to name a different session as the one that settles it. '
-      + 'acceptance_criteria is the minimum requirement the reviewer settles against. A rejected result '
-      + 'sends the SAME task back to the worker for rework — the task id never changes across attempts. '
-      + 'To answer a peer\'s request_input, pass task_id — your message becomes the answer and the task '
-      + 'resumes. Use mode=steer only when the news invalidates what the peer is doing right now.',
+      + 'acceptance_criteria is the minimum requirement the reviewer settles against. A rejected '
+      + 'result sends the SAME task back to the worker for rework — the task id never changes across '
+      + 'attempts. To answer a peer\'s request_input, pass task_id — your message becomes the answer '
+      + 'and the task resumes. Use mode=steer only when the news invalidates what the peer is doing '
+      + 'right now. For a multi-step effort, use create_flow instead and build the DAG.',
     parameters: {
       target: { type: 'string', required: true, description: 'Session id of the peer, from list_peers.' },
       content: { type: 'string', required: true, description: 'The task instruction or answer.' },
@@ -705,6 +827,16 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         const reviewerDecision = await authorizePeer(ctx, workspaces, callerId, args.reviewer as SessionId)
         if (!reviewerDecision.ok) throw new Error(reviewerDecision.message)
         reviewer = args.reviewer as SessionId
+      }
+      // Self-execution keeps accountability: when the caller is also the
+      // executor, the reviewer MUST be a different session — nobody approves
+      // their own work.
+      if (targetId === callerId) {
+        if (reviewer === undefined || reviewer === callerId) {
+          throw new Error(
+            'self-execution requires reviewer: when target is yourself, name a different session as reviewer',
+          )
+        }
       }
       const dependencies = (args.dependencies as string[] | undefined)?.map(id => TaskId(id))
       // Flow membership: the flow must exist in the caller's workspace. The
@@ -892,6 +1024,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
             reason: { type: 'string' },
             retries: { type: 'number', required: true },
             acceptanceCriteria: { type: 'string' },
+            dependencies: { type: 'array', items: { type: 'string' } },
           },
         },
       },
@@ -947,6 +1080,18 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
           to: { type: 'string' },
           content: { type: 'string', required: true },
           acceptanceCriteria: { type: 'string' },
+          handoffs: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                fromTask: { type: 'string', required: true },
+                document: { type: 'string', required: true },
+                at: { type: 'string', required: true },
+              },
+            },
+          },
           report: { type: 'string' },
           question: { type: 'string' },
           outcome: { type: 'string' },
@@ -1104,10 +1249,42 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       // cleared. The scheduler listener dispatches them.
       if (outcome === 'success') {
         ctx.emit('agent-bus/settle', taskId)
-        // Result returns to the initiator: the loop closes.
+        // Result returns to the initiator: the loop closes. The notice names
+        // every downstream task this one feeds, and the executor is asked to
+        // hand off structured context to each of them.
+        const downstream = ledger.listAll()
+          .filter(row => (row.dependencies ?? []).includes(taskId))
+          .map(row => row.id)
+        const handoffHint = downstream.length > 0
+          ? `该任务为以下后向任务提供前向依赖:${downstream.join(', ')}。执行方请为每个后向任务调用 submit_handoff 提交交接文档。`
+          : ''
         notifySession(ctx, task.assignedBy, taskId,
-          `任务 ${taskId} 已验收通过,状态「已完成」(success)。最终结果:${settled.task.report ?? '(无)'}`,
+          `任务 ${taskId} 已验收通过,状态「已完成」(success)。${handoffHint}最终结果:${settled.task.report ?? '(无)'}`,
           'settle_task')
+        if (task.assignedTo !== undefined && task.assignedTo !== task.assignedBy && downstream.length > 0) {
+          notifySession(ctx, task.assignedTo, taskId,
+            `任务 ${taskId} 已验收通过。它为以下后向任务提供前向依赖:${downstream.join(', ')}。`
+              + `请为每个后向任务调用 submit_handoff(task_id=${taskId}, to_task_id=<后向任务id>, document=<交接文档>) 提交交接文档。`,
+            'settle_task')
+        }
+        // End-of-flow summary: when the settled task closes out its whole
+        // flow, the creator gets one aggregated notice instead of silence —
+        // "the flow finished, here is every step's result".
+        if (task.flowId !== undefined) {
+          const flow = ledger.getFlow(task.flowId)
+          const flowTasks = ledger.listAll().filter(row => row.flowId === task.flowId)
+          const allDone = flowTasks.length > 0 && flowTasks.every(row =>
+            (row.status === 'completed' && row.outcome === 'success')
+            || row.status === 'failed' || row.status === 'canceled' || row.status === 'rejected')
+          if (flow !== undefined && allDone) {
+            const summary = flowTasks.map(row =>
+              `${row.id.slice(0, 8)}: ${row.status === 'completed' ? `已完成(${row.outcome})` : row.status}`,
+            ).join('\n')
+            notifySession(ctx, flow.createdBy, taskId,
+              `流程「${flow.name}」已全部结算,不再有进行中的任务。各任务结果:\n${summary}`,
+              'settle_task')
+          }
+        }
       } else if (task.assignedTo !== undefined) {
         // Rework loop: the worker is woken to execute the SAME task again.
         // The rework notice is a new delivery of the task, so its message id

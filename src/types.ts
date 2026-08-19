@@ -124,6 +124,18 @@ export interface PeerCard {
 }
 
 /**
+ * One handoff document: a completed task's executor delivers structured
+ * context to each task that depends on it. Attached to the DOWNSTREAM task;
+ * dispatch concatenates handoffs into its delivered content.
+ */
+export interface HandoffEntry {
+  /** The completed predecessor whose executor wrote this document. */
+  readonly fromTask: TaskId
+  readonly document: string
+  readonly at: string
+}
+
+/**
  * One flow: a named DAG container for tasks (v1.4). The container has no
  * status of its own — active/archived is derived from its tasks, so adding a
  * task to an archived flow reactivates it automatically.
@@ -193,6 +205,8 @@ export interface TaskRecord {
   readonly acceptanceCriteria?: string
   /** Owning flow id (v1.4); dependencies must stay inside the same flow. */
   readonly flowId?: string
+  /** Handoff documents from settled predecessors; dispatched with the task. */
+  readonly handoffs?: readonly HandoffEntry[]
   /** ISO-8601 creation stamp. */
   readonly createdAt: string
   /** ISO-8601 stamp of the last status change. */
