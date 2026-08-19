@@ -1129,11 +1129,12 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
   ctx.tools.register(defineTool({
     name: 'cancel_task',
     description:
-      'As the dispatcher, cancel a task you dispatched while it is still submitted, working, or '
-      + 'awaiting your input. The worker is interrupted, told the task is canceled, and asked to '
-      + 'report a summary of what it had done; the summary lands on the task (read it with get_task). '
-      + 'Only the session that dispatched a task may cancel it; workers cannot cancel their own '
-      + 'dispatched tasks.',
+      'As the dispatcher, cancel a task you dispatched while it is queued(待投递), submitted, '
+      + 'working, or awaiting your input. The worker is interrupted, told the task is canceled, and '
+      + 'asked to report a summary of what it had done; the summary lands on the task (read it with '
+      + 'get_task). A task that was never delivered (待投递) is canceled without bothering the '
+      + 'worker. Only the session that dispatched a task may cancel it; workers cannot cancel their '
+      + 'own dispatched tasks.',
     parameters: {
       task_id: { type: 'string', required: true, description: 'The ledger task id to cancel.' },
       reason: { type: 'string', description: 'Why the task is canceled, shown to the worker.' },
@@ -1172,8 +1173,11 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
 
       // Interrupt the worker's in-flight turn, then ask for the summary. Both
       // are best-effort: an absent worker keeps the canceled row and the
-      // summary request is skipped.
-      const worker = task.assignedTo !== undefined ? ctx.agents.get(task.assignedTo) : undefined
+      // summary request is skipped. A queued task was never delivered, so its
+      // worker has nothing to summarize — cancel quietly.
+      const worker = task.assignedTo !== undefined && task.status !== 'queued'
+        ? ctx.agents.get(task.assignedTo)
+        : undefined
       if (worker !== undefined) {
         try {
           worker.cancel({ kind: 'user' }, { keepInbox: true })

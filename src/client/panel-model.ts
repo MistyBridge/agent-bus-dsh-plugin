@@ -74,6 +74,8 @@ export interface TaskView {
   readonly archived?: boolean
   /** DAG predecessors (task ids), in declaration order; empty when none. */
   readonly dependencies: readonly string[]
+  /** Dispatcher's minimum acceptance requirement; null when unset. */
+  readonly acceptanceCriteria: string | null
   /** Owning flow id (v1.4); null when the task belongs to no flow. */
   readonly flowId: string | null
   /** Tasks that depend on this one (reverse edges for the DAG view). */
@@ -112,6 +114,7 @@ export interface FlowView {
   readonly id: string
   readonly name: string
   readonly description: string | null
+  readonly workspacePath: string
   readonly taskCount: number
   /** Tasks still in the active set (not archived). */
   readonly unsettledCount: number
@@ -809,15 +812,73 @@ export function hasFailedDependency(task: TaskView, tasks: readonly TaskView[]):
 }
 
 /**
- * Ready but not yet delivered: submitted, every predecessor settled, and
- * the scheduler has not flipped `auto`. Root tasks (no deps) are delivered
- * on create, so they are not treated as queued.
+ * @deprecated v1.4 uses the explicit `queued` status. Kept for older tests.
  */
 export function isReadyUndelivered(task: TaskView, tasks: readonly TaskView[]): boolean {
-  if (task.status !== 'submitted') return false
-  if (predecessorsOf(task).length === 0) return false
-  if (task.auto) return false
-  return blockedByOf(task, tasks).length === 0
+  return task.status === 'queued' && blockedByOf(task, tasks).length === 0
+}
+
+/** Flows of one workspace: active first, then archived. */
+export function flowsOfWorkspace(
+  flows: readonly FlowView[],
+  workspacePath: string | null,
+): FlowView[] {
+  const scoped = workspacePath === null
+    ? [...flows]
+    : flows.filter(flow => flow.workspacePath === workspacePath)
+  return scoped.sort((left, right) => Number(left.archived) - Number(right.archived))
+}
+
+/** Tasks that belong to one flow. Flow-less rows never appear in a DAG. */
+export function tasksOfFlow(tasks: readonly TaskView[], flowId: string | null): TaskView[] {
+  if (flowId === null) return []
+  return tasks.filter(task => task.flowId === flowId)
+}
+
+/**
+ * The DAG's archive rule (v1.4 §6): a terminal failure/cancel/reject leaves
+ * the active set IMMEDIATELY, and a settled success leaves after the 24h
+ * archive phase. This mirrors the flow-archived derivation (panel flows
+ * directory) and the tools' isActiveTask, so a faded node, the flow list,
+ * and the agent-visible set never disagree about what is archived.
+ */
+export function isDagArchived(task: TaskView): boolean {
+  if (task.status === 'failed' || task.status === 'canceled' || task.status === 'rejected') {
+    return true
+  }
+  return isArchived(task)
+}
+
+/**
+ * v1.4 §6.1: active tasks plus every recursive predecessor, so an archived
+ * ancestor chain stays visible beside live work. Terminal-failed tasks are
+ * not anchors but still appear when an active task depends on them.
+ * Isolated archived tasks drop off the graph.
+ */
+export function visibleDagTasks(tasks: readonly TaskView[]): TaskView[] {
+  const byId = new Map(tasks.map(task => [task.id, task]))
+  const keep = new Set<string>()
+  const walk = (id: string): void => {
+    if (keep.has(id)) return
+    const task = byId.get(id)
+    if (task === undefined) return
+    keep.add(id)
+    for (const dep of predecessorsOf(task)) walk(dep)
+  }
+  for (const task of tasks) {
+    if (!isDagArchived(task)) walk(task.id)
+  }
+  return tasks.filter(task => keep.has(task.id))
+}
+
+/** Archived node on a live chain: faded, not interactive. */
+export function isDagFaded(task: TaskView): boolean {
+  return isDagArchived(task)
+}
+
+/** Queued with every predecessor settled — the client scheduler may POST /dispatch. */
+export function isReadyToDispatch(task: TaskView, tasks: readonly TaskView[]): boolean {
+  return task.status === 'queued' && blockedByOf(task, tasks).length === 0
 }
 
 /** Color of a node on a highlighted dependency chain. */

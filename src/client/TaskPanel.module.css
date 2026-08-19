@@ -1139,6 +1139,12 @@ html[data-agent-bus-panel-open] .abPPreview {
   cursor: grabbing;
 }
 
+.abPDagNode[data-archived] {
+  opacity: 0.42;
+  cursor: default;
+  pointer-events: none;
+}
+
 .abPDagNode[data-dim] {
   opacity: 0.34;
 }

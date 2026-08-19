@@ -140,6 +140,7 @@ export interface FlowView {
   readonly id: string
   readonly name: string
   readonly description: string | null
+  readonly workspacePath: string
   readonly taskCount: number
   /** Tasks still in the active set (not archived). */
   readonly unsettledCount: number
@@ -536,9 +537,10 @@ export async function buildPanelSnapshot(
       id: flow.id,
       name: flow.name,
       description: flow.description ?? null,
+      workspacePath: flow.workspacePath,
       taskCount: tasks.length,
       unsettledCount: unsettled.length,
-      archived: unsettled.length === 0,
+      archived: tasks.length > 0 && unsettled.length === 0,
     }
   })
 

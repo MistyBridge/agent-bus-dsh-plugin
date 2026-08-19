@@ -1,6 +1,6 @@
 /**
- * DAG board for the v1.2 flow window: layered nodes, hover/pin chain
- * highlight, and an inline detail pane. Pure presentation over panel-model.
+ * DAG board for the v1.4 flow window: pick a flow, then a canvas of that
+ * flow's tasks. Archived ancestors fade; live nodes stay interactive.
  *
  * @module dsh-agent-bus/client/DagView
  */
@@ -17,15 +17,17 @@ import {
   formatTokenUsage,
   hasFailedDependency,
   hasUnreadableTokens,
-  isReadyUndelivered,
+  isDagFaded,
   layoutDag,
   relativeTime,
   statusLabel,
   statusTone,
+  tasksOfFlow,
   tokensForSession,
   truncateCodePoints,
+  visibleDagTasks,
   type ChainTone,
-  type SessionView,
+  type FlowView,
   type TaskView,
   type TokenBuckets,
 } from './panel-model.ts'
@@ -37,6 +39,7 @@ const ROLE_LABEL = {
 } as const
 
 function badgeKind(task: TaskView): 'solid' | 'dashed' | 'outline' {
+  if (task.status === 'queued') return 'dashed'
   if (task.status === 'completed' && task.outcome === null) return 'dashed'
   if (task.status === 'canceled') return 'outline'
   return 'solid'
@@ -47,12 +50,6 @@ function reportZoneLabel(zone: TaskView['reportZone']): string | null {
   if (zone === 'cold') return '报告外置·冷(已归档)'
   if (zone === 'missing') return '报告缺失'
   return null
-}
-
-function taskTouchesSession(task: TaskView, sessionId: string): boolean {
-  return task.assignedBy === sessionId
-    || task.assignedTo === sessionId
-    || task.assignedReviewer === sessionId
 }
 
 function TokenTriple({ tokens }: { tokens: TokenBuckets | null }): JSX.Element {
@@ -73,11 +70,11 @@ function StatusBadge({ task }: { task: TaskView }): JSX.Element {
 }
 
 function nodeMark(task: TaskView, tasks: readonly TaskView[]): string | null {
+  if (isDagFaded(task)) return '已归档'
   const propagated = failureReasonOf(task)
   if (propagated !== null) return propagated
   if (hasFailedDependency(task, tasks)) return '依赖失败'
   if (blockedByOf(task, tasks).length > 0) return '等待依赖'
-  if (isReadyUndelivered(task, tasks)) return '待释放'
   return null
 }
 
@@ -210,6 +207,9 @@ function TaskDetail({
       {task.blockedBy.length > 0 && (
         <div className="abPTaskMeta">{`等待依赖 ${task.blockedBy.join(' · ')}`}</div>
       )}
+      {task.acceptanceCriteria !== null && task.acceptanceCriteria !== '' && (
+        <div className="abPTaskMeta">{`验收标准 ${task.acceptanceCriteria}`}</div>
+      )}
       <pre className="abPContent">{task.content}</pre>
       <div className="abPStaffHead">
         本任务合计
@@ -250,10 +250,9 @@ function TaskDetail({
 
 export interface DagViewProps {
   readonly tasks: readonly TaskView[]
-  readonly sessions: readonly SessionView[]
-  readonly currentSessionId: string | undefined
-  readonly sessionFilter: string | null
-  readonly onSessionFilter: (id: string | null) => void
+  readonly flows: readonly FlowView[]
+  readonly selectedFlowId: string | null
+  readonly onSelectFlow: (id: string) => void
   readonly sidebarWidth: number
   readonly onSidebarResizeDown: (event: ReactPointerEvent<HTMLDivElement>) => void
   readonly onSidebarResizeMove: (event: ReactPointerEvent<HTMLDivElement>) => void
@@ -269,10 +268,9 @@ export interface DagViewProps {
  */
 export function DagView({
   tasks,
-  sessions,
-  currentSessionId,
-  sessionFilter,
-  onSessionFilter,
+  flows,
+  selectedFlowId,
+  onSelectFlow,
   sidebarWidth,
   onSidebarResizeDown,
   onSidebarResizeMove,
@@ -280,7 +278,11 @@ export function DagView({
   nowMs,
   consumeEscRef,
 }: DagViewProps): JSX.Element {
-  const graph = useMemo(() => dagOf(tasks), [tasks])
+  const flowTasks = useMemo(
+    () => visibleDagTasks(tasksOfFlow(tasks, selectedFlowId)),
+    [tasks, selectedFlowId],
+  )
+  const graph = useMemo(() => dagOf(flowTasks), [flowTasks])
   const layout = useMemo(() => layoutDag(graph), [graph])
   const [pos, setPos] = useState<Record<string, Point>>(readPos)
   const posRef = useRef(pos)
@@ -296,7 +298,6 @@ export function DagView({
   const [panning, setPanning] = useState(false)
   const [draggingId, setDraggingId] = useState<string | null>(null)
   const seenSuccess = useRef<Set<string> | null>(null)
-  const fitted = useRef(false)
   const panDrag = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(null)
   const nodeDrag = useRef<{
     id: string
@@ -417,11 +418,9 @@ export function DagView({
   }, [layout.boxes])
 
   useLayoutEffect(() => {
-    if (fitted.current || boxes.length === 0) return
-    fitted.current = true
-    if (readView() !== null) return
-    fitView()
-  }, [boxes.length])
+    if (boxes.length === 0) return
+    fitTo(boxes)
+  }, [selectedFlowId])
 
   useEffect(() => {
     const el = canvasRef.current
@@ -434,7 +433,7 @@ export function DagView({
     }
     el.addEventListener('wheel', onWheel, { passive: false })
     return () => el.removeEventListener('wheel', onWheel)
-  }, [tasks.length])
+  }, [flowTasks.length])
 
   const focusId = pinnedId ?? hoverId
   const chain = useMemo(() => {
@@ -470,7 +469,7 @@ export function DagView({
 
   useEffect(() => {
     const success = new Set(
-      tasks.filter(task => task.status === 'completed' && task.outcome === 'success').map(task => task.id),
+      flowTasks.filter(task => task.status === 'completed' && task.outcome === 'success').map(task => task.id),
     )
     const previous = seenSuccess.current
     seenSuccess.current = success
@@ -491,7 +490,7 @@ export function DagView({
       })
     }, 2000)
     return () => window.clearTimeout(timer)
-  }, [tasks, taskById])
+  }, [flowTasks, taskById])
 
   const onCanvasPointerDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
     if (event.button !== 0) return
@@ -527,6 +526,8 @@ export function DagView({
 
   const onNodePointerDown = (event: ReactPointerEvent<HTMLButtonElement>, id: string): void => {
     if (event.button !== 0) return
+    const task = taskById.get(id)
+    if (task !== undefined && isDagFaded(task)) return
     event.stopPropagation()
     event.currentTarget.setPointerCapture(event.pointerId)
     const box = byId.get(id)
@@ -571,8 +572,9 @@ export function DagView({
     setDetailId(id)
   }
 
-  const liveSessions = sessions.filter(session => session.live)
-  const offlineSessions = sessions.filter(session => !session.live)
+  const activeFlows = flows.filter(flow => !flow.archived)
+  const archivedFlows = flows.filter(flow => flow.archived)
+  const selectedFlow = flows.find(flow => flow.id === selectedFlowId) ?? null
   const grid = GRID_PX * view.zoom
 
   return (
@@ -589,60 +591,61 @@ export function DagView({
           onPointerCancel={onSidebarResizeUp}
         />
         <div className="abPAll">
-          <button
-            type="button"
-            className="abPAllBtn"
-            data-active={sessionFilter === null || undefined}
-            onClick={() => onSessionFilter(null)}
-          >
-            全部会话
-          </button>
+          <span className="abPAllBtn">活跃流程</span>
         </div>
         <div className="abPSessionList">
-          {liveSessions.map(session => (
+          {activeFlows.length === 0 && (
+            <div className="abPOffline">暂无活跃流程</div>
+          )}
+          {activeFlows.map(flow => (
             <button
-              key={session.id}
+              key={flow.id}
               type="button"
               className="abPSession"
-              data-active={sessionFilter === session.id || undefined}
-              data-current={session.id === currentSessionId || undefined}
-              onClick={() => onSessionFilter(sessionFilter === session.id ? null : session.id)}
+              data-active={selectedFlowId === flow.id || undefined}
+              onClick={() => onSelectFlow(flow.id)}
             >
               <span className="abPLive" data-on />
               <span className="abPSessionText">
-                <span className="abPSessionTitle">{session.title}</span>
+                <span className="abPSessionTitle">{flow.name}</span>
+                <span className="abPOffline">{`${flow.unsettledCount}/${flow.taskCount}`}</span>
               </span>
             </button>
           ))}
         </div>
-        {offlineSessions.length > 0 && (
-          <div className="abPGroup">
-            <div className="abPSessionList">
-              {offlineSessions.map(session => (
-                <button
-                  key={session.id}
-                  type="button"
-                  className="abPSession"
-                  data-active={sessionFilter === session.id || undefined}
-                  data-current={session.id === currentSessionId || undefined}
-                  onClick={() => onSessionFilter(sessionFilter === session.id ? null : session.id)}
-                >
-                  <span className="abPLive" />
-                  <span className="abPSessionText">
-                    <span className="abPSessionTitle">{session.title}</span>
-                    <span className="abPOffline">离线</span>
-                  </span>
-                </button>
-              ))}
-            </div>
+        <div className="abPGroup">
+          <div className="abPAll">
+            <span className="abPAllBtn">归档流程</span>
           </div>
-        )}
+          <div className="abPSessionList">
+            {archivedFlows.map(flow => (
+              <button
+                key={flow.id}
+                type="button"
+                className="abPSession"
+                data-active={selectedFlowId === flow.id || undefined}
+                onClick={() => onSelectFlow(flow.id)}
+              >
+                <span className="abPLive" />
+                <span className="abPSessionText">
+                  <span className="abPSessionTitle">{flow.name}</span>
+                  <span className="abPOffline">{`${flow.taskCount} 已归档`}</span>
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
       </nav>
       <div className="abPDagPane">
-        {tasks.length === 0 ? (
+        {selectedFlow === null ? (
           <div className="abPEmpty">
-            <div className="abPEmptyTitle">暂无流程任务</div>
-            <div className="abPEmptyHint">带依赖的任务会在这里按拓扑展开</div>
+            <div className="abPEmptyTitle">请选择一个流程</div>
+            <div className="abPEmptyHint">DAG 按流程展示，无流程的任务不会出现在这里</div>
+          </div>
+        ) : flowTasks.length === 0 ? (
+          <div className="abPEmpty">
+            <div className="abPEmptyTitle">{`${selectedFlow.name} 暂无节点`}</div>
+            <div className="abPEmptyHint">用 create_task 并把 flow_id 指到这个流程</div>
           </div>
         ) : (
           <div
@@ -702,14 +705,14 @@ export function DagView({
                 })}
               </svg>
               {boxes.map(box => {
-                const mark = nodeMark(box.task, tasks)
-                const ready = isReadyUndelivered(box.task, tasks)
-                const failedDep = hasFailedDependency(box.task, tasks) || failureReasonOf(box.task) !== null
-                const blocked = blockedByOf(box.task, tasks).length > 0
+                const faded = isDagFaded(box.task)
+                const mark = nodeMark(box.task, flowTasks)
+                const ready = box.task.status === 'queued'
+                const failedDep = hasFailedDependency(box.task, flowTasks) || failureReasonOf(box.task) !== null
+                const blocked = blockedByOf(box.task, flowTasks).length > 0
                 const settledOk = box.task.status === 'completed' && box.task.outcome === 'success'
-                const inSession = sessionFilter === null || taskTouchesSession(box.task, sessionFilter)
                 const tone = chainTone.get(box.id)
-                const dim = (focusId !== null && tone === undefined) || !inSession
+                const dim = faded || (focusId !== null && tone === undefined)
                 return (
                   <button
                     key={box.id}
@@ -724,12 +727,13 @@ export function DagView({
                     data-ok={settledOk || undefined}
                     data-flare={flare.has(box.id) || undefined}
                     data-dim={dim || undefined}
+                    data-archived={faded || undefined}
                     data-dragging={draggingId === box.id || undefined}
-                    data-current={currentSessionId !== undefined && taskTouchesSession(box.task, currentSessionId) || undefined}
+                    disabled={faded}
                     aria-pressed={pinnedId === box.id}
                     aria-label={`${statusLabel(box.task.status, box.task.outcome)} ${box.task.contentPreview}`}
-                    onMouseEnter={() => setHoverId(box.id)}
-                    onFocus={() => setHoverId(box.id)}
+                    onMouseEnter={() => { if (!faded) setHoverId(box.id) }}
+                    onFocus={() => { if (!faded) setHoverId(box.id) }}
                     onPointerDown={event => onNodePointerDown(event, box.id)}
                     onPointerMove={onNodePointerMove}
                     onPointerUp={() => onNodePointerUp(box.id)}

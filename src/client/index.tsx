@@ -23,6 +23,9 @@ export const inject = ['slots', 'sessions']
 const AGENT_BUS_TOOLS = [
   'list_peers',
   'send_note',
+  'create_flow',
+  'list_flows',
+  'create_task',
   'dispatch_task',
   'edit_task',
   'list_tasks',

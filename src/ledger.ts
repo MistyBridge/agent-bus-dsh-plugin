@@ -401,7 +401,9 @@ export class TaskLedger {
         content: task.content,
         status: blocked ? 'queued' : 'submitted',
         mode: task.mode,
-        ...(task.messageId !== undefined ? { messageId: task.messageId } : {}),
+        // A queued row is undelivered BY DEFINITION: it must never carry a
+        // messageId, whatever the caller passed.
+        ...(blocked ? {} : task.messageId !== undefined ? { messageId: task.messageId } : {}),
         retries: task.retries,
         createdAt: now,
         updatedAt: now,
