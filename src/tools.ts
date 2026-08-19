@@ -396,7 +396,6 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       depends_on: {
         type: 'array',
         items: { type: 'string' },
-        maxItems: 16,
         description: 'DAG predecessors: task ids that must settle before this one is dispatched. '
           + 'When any predecessor is unsettled the task is only created — the scheduler dispatches '
           + 'it automatically once every dependency settles. Edit it with edit_task before it dispatches.',
@@ -517,7 +516,6 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       depends_on: {
         type: 'array',
         items: { type: 'string' },
-        maxItems: 16,
         description: 'New predecessor list; omit to keep the current one, pass [] to clear all dependencies.',
       },
     },
