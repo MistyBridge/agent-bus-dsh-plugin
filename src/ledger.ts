@@ -17,6 +17,9 @@
  * @module dsh-agent-bus/ledger
  */
 
+import { mkdir, readdir, unlink, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { DomainGlobal, KvTable } from '@deepseek-ai/dsh-storage-domain'
@@ -242,7 +245,44 @@ export class TaskLedger {
     ledger.table = domain.table('tasks')
     ledger.peers = domain.table('peers')
     ledger.global = domain.global
+    await ledger.snapshotBackup()
     return ledger
+  }
+
+  /**
+   * Write a full content snapshot to the backups dir, kept to the newest 20.
+   *
+   * Insurance, not runtime data: the ledger itself never deletes rows, but a
+   * domain version bump recreates the medium wholesale (see v1.2 spec §2.1 —
+   * that is how task e420b249 and the v5-era rows were lost). Every open
+   * writes one snapshot so a later loss is at least recoverable from the last
+   * boot that saw the rows. Best-effort: a failed snapshot logs and does not
+   * fail boot.
+   */
+  private async snapshotBackup(): Promise<void> {
+    // vitest sets NODE_ENV=test; unit tests open the ledger over in-memory
+    // domains and must not scribble on the real backup dir (or prune real
+    // snapshots).
+    if (process.env.NODE_ENV === 'test') return
+    const dir = dshHomePath('agent-bus', 'backups')
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const rows = this.listAll()
+    const snapshot = {
+      at: new Date().toISOString(),
+      taskIds: this.global.get().taskIds,
+      tasks: rows,
+      peers: Array.from(this.peers.keys(), key => ({ key, card: this.peers.get(key) })),
+    }
+    try {
+      await mkdir(dir, { recursive: true })
+      await writeFile(join(dir, `ledger-${stamp}.json`), JSON.stringify(snapshot, null, 1), 'utf8')
+      const files = (await readdir(dir)).filter(name => name.startsWith('ledger-')).sort()
+      const stale = files.slice(0, Math.max(0, files.length - 20))
+      await Promise.all(stale.map(name => unlink(join(dir, name))))
+    } catch (error: unknown) {
+      // eslint-disable-next-line no-console
+      console.error(`agent-bus: ledger snapshot backup failed: ${String(error)}`)
+    }
   }
 
   /** Serialize one mutation behind every earlier one. */

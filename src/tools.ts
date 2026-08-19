@@ -24,7 +24,7 @@ import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
 import { authorizePeer, authorizeSettlement, resolveWorkspacePath } from './authorize.ts'
-import { admitContent, buildTaskMessage, deliverTask } from './delivery.ts'
+import { admitContent, buildMessageMessage, buildTaskMessage, deliverTask, type DeliverySource } from './delivery.ts'
 import type { ReportStore } from './external.ts'
 import { blockedByOf, type TaskLedger } from './ledger.ts'
 import { isTokenBuckets, staffRoles } from './panel.ts'
@@ -39,6 +39,8 @@ export interface ToolsConfig {
   readonly maxSendsPerMinute: number
   /** Reports longer than this are externalized to the report store (default `400`). */
   readonly maxInlineReport: number
+  /** Lightweight messages one sender may send per minute (default `20`). */
+  readonly maxMessagesPerMinute: number
 }
 
 /** Services the tool bodies need beyond `ctx`. */
@@ -46,6 +48,8 @@ export interface ToolsDeps {
   readonly ledger: TaskLedger
   readonly workspaces: WorkspaceRegistry
   readonly limiter: DispatchRateLimiter
+  /** Separate sliding window for send_message, so chatter cannot exhaust task quota. */
+  readonly messageLimiter: DispatchRateLimiter
   readonly reports: ReportStore
 }
 
@@ -254,10 +258,16 @@ function snapshotTokensAtDispatch(
   return Object.keys(out).length === 0 ? undefined : out
 }
 
-export function notifySession(ctx: Context, sessionId: SessionId, taskId: TaskId, text: string): void {
+export function notifySession(
+  ctx: Context,
+  sessionId: SessionId,
+  taskId: TaskId,
+  text: string,
+  tool: DeliverySource = 'dispatch_task',
+): void {
   const session = ctx.agents.get(sessionId)
   if (session === undefined) return
-  const notice = buildTaskMessage(sessionId, taskId, text)
+  const notice = buildTaskMessage(sessionId, taskId, text, tool)
   deliverTask(session, notice, 'followup')
 }
 
@@ -361,6 +371,60 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         })
       }
       return peers
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'send_message',
+    description:
+      'Send a lightweight message to a live peer in your workspace: a note, a question, a '
+      + 'confirmation, a coordination ping — anything that is NOT work the peer must deliver a '
+      + 'verifiable result for. The message lands in the peer\'s inbox like an ordinary message; '
+      + 'there is NO task record, no acceptance, and nothing to report or settle. The peer simply '
+      + 'replies in prose (with send_message back to you, if it replies at all). Use dispatch_task '
+      + 'instead when the peer must produce a result you will verify — a message channel needs no '
+      + 'lifecycle, and a task channel whose work was really a chat is how tasks get stuck forever '
+      + 'in working.',
+    parameters: {
+      target: { type: 'string', required: true, description: 'Session id of the peer, from list_peers.' },
+      content: { type: 'string', required: true, description: 'The message text.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          delivered: { type: 'boolean', required: true },
+          messageId: { type: 'string', required: true },
+        },
+      },
+      render: (_args, result) => [{
+        type: 'text',
+        text: result.delivered
+          ? `message delivered (${String(result.messageId).slice(0, 8)}…)`
+          : 'message not delivered',
+      }],
+    },
+    presentCall: (args) => ({ card: 'generic', title: 'agent-bus:发送消息', kind: 'other', rawInput: { target: args.target } }),
+    presentResult: (_args, result) => ({ card: 'generic', title: 'agent-bus:发送消息', rawInput: result }),
+    async execute(args, exec) {
+      const callerId = requireCaller(exec.agent, 'send_message')
+      if (!deps.messageLimiter.admit(callerId, Date.now())) {
+        throw new Error(
+          `message rate exceeded: at most ${config.maxMessagesPerMinute} messages per minute`,
+        )
+      }
+      const targetId = args.target as SessionId
+      const decision = await authorizePeer(ctx, workspaces, callerId, targetId)
+      if (!decision.ok) throw new Error(decision.message)
+      const admitted = admitContent(args.content, config.maxContentLength)
+      if (!admitted.ok) throw new Error(admitted.message)
+      // No ledger write: a message has no row, so the claimed-listener cannot
+      // match it and no lifecycle ever starts. The message id is generated
+      // here and returned so the sender keeps a delivery receipt.
+      const message = buildMessageMessage(callerId, randomUUID(), admitted.content)
+      deliverTask(decision.target, message, 'followup')
+      return { delivered: true, messageId: message.id }
     },
   }))
 
@@ -765,7 +829,8 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         ? `${admitted.content.slice(0, 200)}…`
         : admitted.content
       notifySession(ctx, reviewer, taskId,
-        `任务 ${taskId} 已完成,请调用 settle_task 验收。提交结果摘要:${excerpt}`)
+        `任务 ${taskId} 已完成,请调用 settle_task 验收。提交结果摘要:${excerpt}`,
+        'report_task')
       return { taskId, status: completed.task.status }
     },
   }))
@@ -823,7 +888,8 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         ctx.emit('agent-bus/settle', taskId)
         // Result returns to the initiator: the loop closes.
         notifySession(ctx, task.assignedBy, taskId,
-          `任务 ${taskId} 已验收通过(success)。最终结果:${settled.task.report ?? '(无)'}`)
+          `任务 ${taskId} 已验收通过(success)。最终结果:${settled.task.report ?? '(无)'}`,
+          'settle_task')
       } else if (task.assignedTo !== undefined) {
         // Rework loop: the worker is woken to execute the SAME task again.
         // The rework notice is a new delivery of the task, so its message id
@@ -831,7 +897,8 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         // cannot find the task and it never leaves `submitted`.
         const instruction = args.feedback !== undefined ? args.feedback : '请根据验收意见重新执行。'
         const reworkNotice = buildTaskMessage(callerId, taskId,
-          `任务 ${taskId} 未通过验收(failure)。修改意见:${instruction}。请重新执行后调用 report_task 再次提交。`)
+          `任务 ${taskId} 未通过验收(failure)。修改意见:${instruction}。请重新执行后调用 report_task 再次提交。`,
+          'settle_task')
         const recorded = await ledger.recordDelivery(taskId, reworkNotice.id)
         if (!recorded.ok) throw new Error(recorded.message)
         const worker = ctx.agents.get(task.assignedTo)
@@ -898,7 +965,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         }
         const note = `任务 ${taskId} 已被派发方取消${reason?.ok === true ? `(${reason.content})` : ''}。`
           + '请用 report_task 提交你已完成部分的摘要。'
-        const summary = buildTaskMessage(callerId, taskId, note)
+        const summary = buildTaskMessage(callerId, taskId, note, 'cancel_task')
         deliverTask(worker, summary, 'followup')
       }
       return { taskId, status: canceled.task.status }

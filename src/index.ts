@@ -62,6 +62,8 @@ export interface Config {
   maxPendingPerAgent?: number
   /** Dispatches one sender may issue per minute (default `10`). */
   maxSendsPerMinute?: number
+  /** Lightweight messages one sender may send per minute (default `20`). */
+  maxMessagesPerMinute?: number
   /** How long a working or input-required task may sit before failing (default `7200000`, 2 hours). */
   taskTimeoutMs?: number
   /** Reports longer than this are externalized to the report store (default `400`). */
@@ -74,6 +76,7 @@ export const Config: z<Config> = z.object({
   maxContentLength: z.natural().min(1).default(16000),
   maxPendingPerAgent: z.natural().min(1).default(20),
   maxSendsPerMinute: z.natural().min(1).default(10),
+  maxMessagesPerMinute: z.natural().min(1).default(20),
   taskTimeoutMs: z.natural().min(60_000).default(7_200_000),
   maxInlineReport: z.natural().min(1).default(400),
   promptSectionOrder: z.natural().default(118),
@@ -82,8 +85,9 @@ export const Config: z<Config> = z.object({
 /** The model-facing usage policy. */
 const USAGE_TEXT = `You share a workspace with other agent sessions and can dispatch work to them.
 
-- list_peers shows the live sessions in your workspace: their names, their self-declared cards, and how busy they are. They are the only valid dispatch_task targets.
-- dispatch_task dispatches one task to one peer. The peer works its queued tasks one at a time, each as its own turn, and only starts the next one after finishing the current one — you do not need to pace dispatches. Passing task_id answers a peer's request_input and lets its paused task resume. Passing reviewer names a different session as the one that settles the result; without it you settle it yourself.
+- list_peers shows the live sessions in your workspace: their names, their self-declared cards, and how busy they are. They are the only valid dispatch_task and send_message targets.
+- send_message sends a lightweight message to one peer: a note, a question, a confirmation — anything that is NOT work the peer must deliver a verifiable result for. There is NO task record, NO acceptance, and nothing to report or settle; the peer simply replies in prose, and if it replies it sends a message back to you. When a message you receive carries the <dsh-agent-bus-message> header, treat it as ordinary conversation, not work.
+- dispatch_task dispatches one task to one peer. Use it only for work that must produce a verifiable result: a chat disguised as a task is how tasks get stuck forever in working, because a task waits for report_task and settle_task while a chat expects none. The peer works its queued tasks one at a time, each as its own turn, and only starts the next one after finishing the current one — you do not need to pace dispatches. Passing task_id answers a peer's request_input and lets its paused task resume. Passing reviewer names a different session as the one that settles the result; without it you settle it yourself.
 - list_tasks with scope=inbox shows work assigned to you, in the order you will do it. With scope=outbox it shows what you initiated: completed tasks carry the worker's report, waiting for the reviewer's verdict. Pass status to filter.
 - get_task reads one task's full record, including the complete report and question text.
 - report_task is the worker's way to finish: a working task becomes completed and the reviewer is notified to settle it. If the task was canceled, report_task attaches your work summary instead.
@@ -95,11 +99,19 @@ const USAGE_TEXT = `You share a workspace with other agent sessions and can disp
 - update_card maintains your own capability card: a description for other agents and machine-readable capabilities for routing.
 - To orchestrate a flow, split the work into tasks and dispatch them with depends_on: each task names the tasks that must settle before it. A task with unsettled dependencies is only created — the scheduler dispatches it automatically once its dependencies settle, and failure propagates down the chain automatically when a dependency fails terminally. edit_task rewrites an undispatched task's requirement or dependencies if the DAG turns out wrong.
 
-When you receive a task, it arrives as an ordinary message with a <dsh-agent-bus> header naming the sender and task id. Do the work, then call report_task with that task id. When a notice tells you a task you review is completed, settle it promptly; when a notice tells you your task failed review, rework it and report again. Only the reviewer can settle and only the initiator can cancel, so never mark your own work complete.
+Incoming agent-bus messages open with a header naming the request kind, so read it first:
+- <dsh-agent-bus task="…" tool="dispatch_task" sender="…"> — a task to work; do it and call report_task with that task id.
+- <dsh-agent-bus task="…" tool="scheduler" sender="…"> — an auto-dispatched task (its dependencies settled); work it like any task.
+- <dsh-agent-bus task="…" tool="report_task" …> — a result you review is waiting; settle it promptly.
+- <dsh-agent-bus task="…" tool="settle_task" …> — on failure, rework the same task and report again; on success, the task is done.
+- <dsh-agent-bus task="…" tool="cancel_task" …> — your task was canceled; report a summary of what you had done.
+- <dsh-agent-bus task="…" tool="reminder|timeout" …> — a system notice; it needs no separate action, only your report if you still owe one.
+- <dsh-agent-bus-message tool="send_message" sender="…" id="…"> — a chat message, not a task; reply in prose if you wish, nothing to report or settle.
+Only the reviewer can settle and only the initiator can cancel, so never mark your own work complete.
 
 Delivery reaches live sessions only. A refusal from dispatch_task is authoritative: the peer is not reachable, not in your workspace, or its queue is full.
 
-Tools: list_peers, dispatch_task, edit_task, list_tasks, get_task, report_task, settle_task, cancel_task, request_input, update_card`
+Tools: list_peers, send_message, dispatch_task, edit_task, list_tasks, get_task, report_task, settle_task, cancel_task, request_input, update_card`
 
 /**
  * Mount the gateway.
@@ -116,6 +128,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     maxContentLength: config.maxContentLength ?? 16000,
     maxPendingPerAgent: config.maxPendingPerAgent ?? 20,
     maxSendsPerMinute: config.maxSendsPerMinute ?? 10,
+    maxMessagesPerMinute: config.maxMessagesPerMinute ?? 20,
     maxInlineReport: config.maxInlineReport ?? 400,
   }
 
@@ -127,6 +140,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
 
   const ledger = await TaskLedger.open(ctx)
   const limiter = new DispatchRateLimiter(resolved.maxSendsPerMinute, 60_000)
+  // Separate window for the message channel: chatter must not exhaust the
+  // task quota, and a dispatch loop must not be able to hide behind message
+  // rate.
+  const messageLimiter = new DispatchRateLimiter(resolved.maxMessagesPerMinute, 60_000)
   const reports = new ReportStore(
     dshHomePath('agent-bus', 'cache'),
     dshHomePath('agent-bus', 'archive'),
@@ -135,6 +152,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     ledger,
     workspaces: ctx.workspaceRegistry,
     limiter,
+    messageLimiter,
     reports,
   })
 
@@ -197,6 +215,29 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     }
   })
 
+  // Turn-end reminder: an executor that finishes a turn without reporting
+  // leaves its task in working forever (the PM-receives-a-misdirected-task
+  // case: the worker answered in prose but never called report_task). After
+  // every turn/end of a session holding a working task, remind once with a
+  // cooldown so the loop cannot stall silently — and so multi-turn work is
+  // not nagged to death.
+  const lastReminder = new Map<string, number>()
+  const REMINDER_COOLDOWN_MS = 15 * 60 * 1000
+  ctx.on('session/event', (session, event) => {
+    if (event.type !== 'turn/end') return
+    for (const task of ledger.listFor(session.id)) {
+      if (task.status !== 'working') continue
+      const key = String(task.id)
+      const last = lastReminder.get(key) ?? 0
+      if (Date.now() - last < REMINDER_COOLDOWN_MS) continue
+      lastReminder.set(key, Date.now())
+      notifySession(ctx, session.id, task.id,
+        `任务 ${task.id} 的当前轮次已结束,但任务仍处于进行中。如果已经完成,请调用 report_task 提交结果;如果还需要继续处理,可以忽略本提醒。`,
+        'reminder')
+      break
+    }
+  })
+
   // DAG auto-scheduling: settle success releases every dependent whose
   // blockers cleared; a startup sweep restores pending releases after a
   // restart; a periodic backstop covers anything the event path missed
@@ -228,7 +269,8 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       void ledger.transition(row.id, 'failed', { reason }).then(() => {
         void reports.archive(row.id)
         notifySession(ctx, row.assignedBy, row.id,
-          `任务 ${row.id} 已超时失败(failed, reason: ${reason})。执行方未在时限内完成或回答。如需重做,请派发新任务。`)
+          `任务 ${row.id} 已超时失败(failed, reason: ${reason})。执行方未在时限内完成或回答。如需重做,请派发新任务。`,
+          'timeout')
       })
     }
   }, Math.min(timeoutMs / 2, 600_000))

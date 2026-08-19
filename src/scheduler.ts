@@ -21,7 +21,7 @@ import type { TaskId } from './types.ts'
 function notifySession(ctx: Context, sessionId: SessionId, taskId: TaskId, text: string): void {
   const session = ctx.agents.get(sessionId)
   if (session === undefined) return
-  const notice = buildTaskMessage(sessionId, taskId, text)
+  const notice = buildTaskMessage(sessionId, taskId, text, 'scheduler')
   deliverTask(session, notice, 'followup')
 }
 
@@ -39,7 +39,7 @@ export async function dispatchOne(ctx: Context, ledger: TaskLedger, id: TaskId):
   if (task === undefined || task.assignedTo === undefined) return
   const worker = ctx.agents.get(task.assignedTo)
   if (worker === undefined) return // offline worker: the row stays undelivered and the sweep retries
-  const message = buildTaskMessage(task.assignedBy, task.id, task.content)
+  const message = buildTaskMessage(task.assignedBy, task.id, task.content, 'scheduler')
   await ledger.recordDelivery(task.id, message.id, true)
   deliverTask(worker, message, task.mode)
   notifySession(
