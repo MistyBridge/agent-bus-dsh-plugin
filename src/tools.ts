@@ -64,6 +64,7 @@ interface TaskView {
   readonly outcome?: string
   readonly reason?: string
   readonly dependencies?: string[]
+  readonly acceptanceCriteria?: string
   readonly retries: number
 }
 
@@ -80,6 +81,7 @@ function view(task: TaskRecord): TaskView {
     ...(task.outcome !== undefined ? { outcome: task.outcome } : {}),
     ...(task.reason !== undefined ? { reason: task.reason } : {}),
     ...(task.dependencies !== undefined ? { dependencies: task.dependencies.map(String) } : {}),
+    ...(task.acceptanceCriteria !== undefined ? { acceptanceCriteria: task.acceptanceCriteria } : {}),
     retries: task.retries,
   }
 }
@@ -123,15 +125,18 @@ export function isActiveTask(row: TaskRecord, now: number): boolean {
     if (row.outcome === undefined) return true
     return now - Date.parse(row.updatedAt) < ARCHIVE_AGE_MS
   }
+  // queued (待投递) counts as active: the scheduler is still driving it.
   return true
 }
 
 export function renderTaskRow(t: TaskView): string {
-  // A completed row without a verdict reads as 「待验收」 to the model, mirroring
-  // the panel badge — a status the reviewer must settle next.
-  const badge = t.status === 'completed' && t.outcome === undefined
-    ? 'completed 待验收'
-    : t.status
+  // Status badges mirror the panel: 「待投递」 for a queued (undelivered) task
+  // and 「待验收」 for a completed row awaiting its verdict.
+  const badge = t.status === 'queued'
+    ? 'queued 待投递'
+    : t.status === 'completed' && t.outcome === undefined
+      ? 'completed 待验收'
+      : t.status
   const head = `${t.id} [${badge}] ${t.content.slice(0, 80)}`
   const report = t.report !== undefined
     ? `\n  submitted result: ${t.report.slice(0, 400)}`
@@ -151,6 +156,7 @@ interface TaskDetailView {
   readonly from: string
   readonly to?: string
   readonly content: string
+  readonly acceptanceCriteria?: string
   readonly report?: string
   readonly question?: string
   readonly outcome?: string
@@ -169,6 +175,7 @@ function detailView(task: TaskRecord): TaskDetailView {
     from: task.assignedBy,
     ...(task.assignedTo !== undefined ? { to: task.assignedTo } : {}),
     content: task.content,
+    ...(task.acceptanceCriteria !== undefined ? { acceptanceCriteria: task.acceptanceCriteria } : {}),
     ...(task.report !== undefined ? { report: task.report } : {}),
     ...(task.question !== undefined ? { question: task.question } : {}),
     ...(task.outcome !== undefined ? { outcome: task.outcome } : {}),
@@ -226,6 +233,7 @@ export function renderTaskDetail(t: TaskDetailView): string {
     'task:',
     t.content,
   ]
+  if (t.acceptanceCriteria !== undefined) lines.push('acceptance criteria:', t.acceptanceCriteria)
   if (t.question !== undefined) lines.push('question:', t.question)
   if (t.report !== undefined) lines.push('submitted result:', t.report)
   if (t.outcome !== undefined) lines.push(`verdict: ${t.outcome}`)
@@ -300,7 +308,7 @@ export function notifySession(
   sessionId: SessionId,
   taskId: TaskId,
   text: string,
-  tool: DeliverySource = 'dispatch_task',
+  tool: DeliverySource = 'create_task',
 ): void {
   const session = ctx.agents.get(sessionId)
   if (session === undefined) return
@@ -322,11 +330,11 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
     name: 'list_peers',
     description:
       'List the other live agent sessions in your workspace, which are the only valid targets for '
-      + 'dispatch_task. Reachability is workspace membership: a session counts as a peer when its '
+      + 'create_task. Reachability is workspace membership: a session counts as a peer when its '
       + 'working directory is the same registered workspace as yours. Archived sessions never appear. '
       + 'Status comes from the live registry — working means it is busy right now, idle means it is '
       + 'loaded and between turns. A peer that wrote a card shows its self-description and '
-      + 'machine-readable capabilities. This snapshot is not a delivery promise; dispatch_task '
+      + 'machine-readable capabilities. This snapshot is not a delivery promise; create_task '
       + 'performs the authoritative check and may still refuse.',
     parameters: {},
     output: {
@@ -421,7 +429,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       + 'confirmation, a coordination ping — anything that is NOT work the peer must deliver a '
       + 'verifiable result for. The note lands in the peer\'s inbox like an ordinary message; '
       + 'there is NO task record, no acceptance, and nothing to report or settle. The peer simply '
-      + 'replies in prose (with send_note back to you, if it replies at all). Use dispatch_task '
+      + 'replies in prose (with send_note back to you, if it replies at all). Use create_task '
       + 'instead when the peer must produce a result you will verify — a note channel needs no '
       + 'lifecycle, and a task channel whose work was really a chat is how tasks get stuck forever '
       + 'in working.',
@@ -469,18 +477,130 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
   }))
 
   ctx.tools.register(defineTool({
-    name: 'dispatch_task',
+    name: 'create_flow',
     description:
-      'Dispatch one task to a live peer in your workspace. The task is recorded in the ledger and '
-      + 'delivered to the peer\'s queue in one step, so a recorded task is always one that was actually '
-      + 'sent. The peer works queued tasks one at a time, each as its own turn, and only picks up the '
-      + 'next one after finishing the current one — you do not need to pace them. Use mode=followup '
-      + '(default) to add work to the end of that queue; use mode=steer only when the news invalidates '
-      + 'what the peer is doing right now, since it interrupts the current step. You become the task\'s '
-      + 'initiator. By default you also review its result; pass reviewer to name a different session as '
-      + 'the one that settles it. A rejected result sends the SAME task back to the worker for rework — '
-      + 'the task id never changes across attempts. To answer a peer\'s request_input, pass task_id — '
-      + 'your message becomes the answer and the task resumes.',
+      'Create a flow: a named DAG container that groups related tasks into one dependency graph. '
+      + 'Create tasks with flow_id to join it; every dependency of a task must live in the same flow '
+      + '(add the task to the flow first with edit_task flow_id), so one flow is always one DAG and '
+      + 'cross-flow references are impossible. The DAG view renders per flow; a flow whose tasks are '
+      + 'all archived moves to the archived section automatically.',
+    parameters: {
+      name: { type: 'string', required: true, description: 'Flow display name, 1–80 characters.' },
+      description: { type: 'string', description: 'Optional note about the flow.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          flowId: { type: 'string', required: true },
+          name: { type: 'string', required: true },
+        },
+      },
+      render: (_args, result) => [{
+        type: 'text',
+        text: `flow ${result.flowId} created: ${result.name}`,
+      }],
+    },
+    presentCall: (args) => ({ card: 'generic', title: 'agent-bus:创建流程', kind: 'other', rawInput: { name: args.name } }),
+    presentResult: (_args, result) => ({ card: 'generic', title: 'agent-bus:创建流程', rawInput: result }),
+    async execute(args, exec) {
+      const callerId = requireCaller(exec.agent, 'create_flow')
+      const name = String(args.name ?? '').trim()
+      if (name.length === 0 || name.length > 80) {
+        throw new Error('flow name must be 1–80 characters')
+      }
+      const description = args.description !== undefined
+        ? admitContent(String(args.description), 400)
+        : undefined
+      if (description !== undefined && !description.ok) throw new Error(description.message)
+      const caller = ctx.agents.get(callerId)
+      if (caller === undefined) throw new Error('create_flow: the calling session is not a live agent')
+      const workspacePath = await resolveWorkspacePath(workspaces, caller)
+      if (workspacePath === undefined) {
+        throw new Error('create_flow: the calling session is not inside a registered workspace')
+      }
+      const flowId = randomUUID()
+      const flow = await ledger.createFlow(
+        flowId, name, description?.ok === true ? description.content : undefined,
+        callerId, workspacePath,
+      )
+      return { flowId: flow.id, name: flow.name }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'list_flows',
+    description:
+      'List the flows in your workspace: each flow\'s name, task counts, and whether it is archived '
+      + '(every task in it has settled and left the active set). Use create_task with flow_id to add '
+      + 'tasks to a flow, and edit_task with flow_id to move a task between flows.',
+    parameters: {},
+    output: {
+      schema: {
+        type: 'array',
+        items: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            id: { type: 'string', required: true },
+            name: { type: 'string', required: true },
+            description: { type: 'string' },
+            taskCount: { type: 'number', required: true },
+            unsettledCount: { type: 'number', required: true },
+            archived: { type: 'boolean', required: true },
+          },
+        },
+      },
+      render: (_args, flows) => [{
+        type: 'text',
+        text: flows.length === 0
+          ? '(no flows)'
+          : flows.map(f =>
+            `${f.name} [${f.archived ? '已归档' : '活跃'}] tasks=${String(f.taskCount)} unsettled=${String(f.unsettledCount)}${f.description !== undefined ? ` — ${f.description.slice(0, 60)}` : ''} (${f.id.slice(0, 8)})`,
+          ).join('\n'),
+      }],
+    },
+    presentCall: () => ({ card: 'generic', title: 'agent-bus:流程列表', kind: 'other' }),
+    presentResult: (_args, flows) => ({ card: 'generic', title: 'agent-bus:流程列表', rawInput: flows }),
+    async execute(_args, exec) {
+      const callerId = requireCaller(exec.agent, 'list_flows')
+      const caller = ctx.agents.get(callerId)
+      if (caller === undefined) throw new Error('list_flows: the calling session is not a live agent')
+      const workspacePath = await resolveWorkspacePath(workspaces, caller)
+      if (workspacePath === undefined) return []
+      const all = ledger.listAll()
+      const flows = ledger.listFlows()
+        .filter(flow => flow.workspacePath === workspacePath)
+        .map(flow => {
+          const tasks = all.filter(row => row.flowId === flow.id)
+          const unsettled = tasks.filter(row => isActiveTask(row, Date.now()))
+          return {
+            id: flow.id,
+            name: flow.name,
+            ...(flow.description !== undefined ? { description: flow.description } : {}),
+            taskCount: tasks.length,
+            unsettledCount: unsettled.length,
+            archived: unsettled.length === 0,
+          }
+        })
+      return flows
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'create_task',
+    description:
+      'Create one task node for a live peer in your workspace. The task is recorded in the ledger; a '
+      + 'task whose dependencies are already settled is delivered to the peer\'s queue in one step, and '
+      + 'a task with unsettled dependencies is created as 待投递(queued) and delivered automatically by '
+      + 'the scheduler once every dependency settles — no pacing needed. The peer works delivered tasks '
+      + 'one at a time, each as its own turn. You become the task\'s initiator. By default you also '
+      + 'review its result; pass reviewer to name a different session as the one that settles it. '
+      + 'acceptance_criteria is the minimum requirement the reviewer settles against. A rejected result '
+      + 'sends the SAME task back to the worker for rework — the task id never changes across attempts. '
+      + 'To answer a peer\'s request_input, pass task_id — your message becomes the answer and the task '
+      + 'resumes. Use mode=steer only when the news invalidates what the peer is doing right now.',
     parameters: {
       target: { type: 'string', required: true, description: 'Session id of the peer, from list_peers.' },
       content: { type: 'string', required: true, description: 'The task instruction or answer.' },
@@ -497,12 +617,22 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         type: 'string',
         description: 'Answering a request_input: the input-required task id. The message answers its question.',
       },
-      depends_on: {
+      dependencies: {
         type: 'array',
         items: { type: 'string' },
-        description: 'DAG predecessors: task ids that must settle before this one is dispatched. '
-          + 'When any predecessor is unsettled the task is only created — the scheduler dispatches '
-          + 'it automatically once every dependency settles. Edit it with edit_task before it dispatches.',
+        description: 'DAG predecessors: task ids that must settle before this one is delivered. '
+          + 'While any predecessor is unsettled the task stays 待投递(queued) — the scheduler delivers '
+          + 'it automatically once every dependency settles. Edit with edit_task before it dispatches.',
+      },
+      acceptance_criteria: {
+        type: 'string',
+        description: 'The minimum acceptance requirement the reviewer settles against; the worker can '
+          + 'read it to know what "done" means.',
+      },
+      flow_id: {
+        type: 'string',
+        description: 'Flow to join (from create_flow). When set, every dependency must belong to the '
+          + 'same flow — add a target task to the flow first if it is not there.',
       },
     },
     output: {
@@ -525,10 +655,10 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
             : ''),
       }],
     },
-    presentCall: (args) => ({ card: 'generic', title: 'agent-bus:派发任务', kind: 'other', rawInput: { target: args.target, ...(args.reviewer !== undefined ? { reviewer: args.reviewer } : {}), ...(args.task_id !== undefined ? { task_id: args.task_id } : {}) } }),
-    presentResult: (_args, result) => ({ card: 'generic', title: 'agent-bus:派发任务', rawInput: result }),
+    presentCall: (args) => ({ card: 'generic', title: 'agent-bus:创建任务', kind: 'other', rawInput: { target: args.target, ...(args.reviewer !== undefined ? { reviewer: args.reviewer } : {}), ...(args.task_id !== undefined ? { task_id: args.task_id } : {}) } }),
+    presentResult: (_args, result) => ({ card: 'generic', title: 'agent-bus:创建任务', rawInput: result }),
     async execute(args, exec) {
-      const callerId = requireCaller(exec.agent, 'dispatch_task')
+      const callerId = requireCaller(exec.agent, 'create_task')
       if (!limiter.admit(callerId, Date.now())) {
         throw new Error(
           `dispatch rate exceeded: at most ${config.maxSendsPerMinute} sends per minute`,
@@ -540,10 +670,14 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
 
       const admitted = admitContent(args.content, config.maxContentLength)
       if (!admitted.ok) throw new Error(admitted.message)
+      const criteria = args.acceptance_criteria !== undefined
+        ? admitContent(args.acceptance_criteria, 2000)
+        : undefined
+      if (criteria !== undefined && !criteria.ok) throw new Error(criteria.message)
 
       const mode: DeliveryMode = args.mode === 'steer' ? 'steer' : 'followup'
 
-      // Answer path: the dispatcher replies to a worker's request_input. The
+      // Answer path: the initiator replies to a worker's request_input. The
       // answer is a new delivery; the task resumes working when it is claimed.
       if (args.task_id !== undefined) {
         const taskId = TaskId(args.task_id)
@@ -564,7 +698,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         return { taskId: String(taskId), status: 'input-required', queuePosition: pending.length, blockedBy: [] as string[] }
       }
 
-      // Dispatch path: a fresh task. Reviewer defaults to the initiator.
+      // Create path: a fresh task node. Reviewer defaults to the initiator.
       const taskId = TaskId(randomTaskId())
       let reviewer: SessionId | undefined
       if (args.reviewer !== undefined) {
@@ -572,7 +706,18 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         if (!reviewerDecision.ok) throw new Error(reviewerDecision.message)
         reviewer = args.reviewer as SessionId
       }
-      const dependencies = (args.depends_on as string[] | undefined)?.map(id => TaskId(id))
+      const dependencies = (args.dependencies as string[] | undefined)?.map(id => TaskId(id))
+      // Flow membership: the flow must exist in the caller's workspace. The
+      // same-flow dependency rule is enforced by the ledger at write time.
+      let flowId: string | undefined
+      if (args.flow_id !== undefined) {
+        const flow = ledger.getFlow(args.flow_id)
+        if (flow === undefined) throw new Error(`no such flow "${args.flow_id}"`)
+        if (flow.workspacePath !== decision.workspacePath) {
+          throw new Error(`flow "${args.flow_id}" belongs to another workspace`)
+        }
+        flowId = flow.id
+      }
       const message = buildTaskMessage(callerId, taskId, admitted.content)
       const tokensAtStart = snapshotTokensAtDispatch(ctx, callerId, targetId, reviewer)
       const recorded = await ledger.record({
@@ -586,13 +731,15 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         retries: 0,
         ...(tokensAtStart !== undefined ? { tokensAtStart } : {}),
         ...(dependencies !== undefined ? { dependencies } : {}),
+        ...(criteria?.ok === true ? { acceptanceCriteria: criteria.content } : {}),
+        ...(flowId !== undefined ? { flowId } : {}),
       }, config.maxPendingPerAgent)
       if (!recorded.ok) throw new Error(recorded.message)
 
-      // A task with dependencies is created without delivery until every
-      // predecessor settles; the scheduler dispatches it then. A task whose
-      // dependencies are already settled delivers immediately, recording the
-      // message id before the inbox can claim it.
+      // A task with dependencies is created queued(待投递) without delivery
+      // until every predecessor settles; the scheduler delivers it then. A
+      // task whose dependencies are already settled delivers immediately,
+      // recording the message id before the inbox can claim it.
       const blocked: string[] = dependencies === undefined
         ? []
         : [...blockedByOf(recorded.task, ledger.listAll()).map(String)]
@@ -610,17 +757,27 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
   ctx.tools.register(defineTool({
     name: 'edit_task',
     description:
-      'Edit a task you created that has not been dispatched yet: rewrite its requirement text and/or its '
-      + 'DAG predecessors (depends_on). The DAG is program-driven — if you find your flow unreasonable, '
-      + 'fix it here before the task dispatches. A dispatched or running task cannot be edited; cancel and '
-      + 'recreate instead. After the edit, the task dispatches automatically if every dependency has settled.',
+      'Edit a task you created that has not been dispatched yet: rewrite its requirement text, its '
+      + 'DAG predecessors (dependencies), and/or its acceptance criteria. The DAG is program-driven — '
+      + 'if you find your flow unreasonable, fix it here before the task dispatches. A dispatched or '
+      + 'running task cannot be edited; cancel and recreate instead. After the edit, the task '
+      + 'dispatches automatically if every dependency has settled.',
     parameters: {
       task_id: { type: 'string', required: true, description: 'The undispatched task to edit.' },
       content: { type: 'string', description: 'New requirement text; omit to keep the current one.' },
-      depends_on: {
+      dependencies: {
         type: 'array',
         items: { type: 'string' },
         description: 'New predecessor list; omit to keep the current one, pass [] to clear all dependencies.',
+      },
+      acceptance_criteria: {
+        type: 'string',
+        description: 'New minimum acceptance requirement; omit to keep the current one.',
+      },
+      flow_id: {
+        type: 'string',
+        description: 'Move the task to another flow; the new flow must contain every dependency of '
+          + 'the task (dependencies move with it, so add them to the new flow first if needed).',
       },
     },
     output: {
@@ -645,7 +802,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       card: 'generic',
       title: 'agent-bus:编辑任务',
       kind: 'other',
-      rawInput: { task_id: args.task_id, ...(args.depends_on !== undefined ? { depends_on: args.depends_on } : {}) },
+      rawInput: { task_id: args.task_id, ...(args.dependencies !== undefined ? { dependencies: args.dependencies } : {}) },
     }),
     presentResult: (_args, result) => ({ card: 'generic', title: 'agent-bus:编辑任务', rawInput: result }),
     async execute(args, exec) {
@@ -656,14 +813,29 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       if (existing.assignedBy !== callerId) {
         throw new Error(`only the session that created task "${taskId}" may edit it`)
       }
-      const patch: { content?: string; dependencies?: TaskId[] } = {}
+      const patch: {
+        content?: string
+        dependencies?: TaskId[]
+        acceptanceCriteria?: string
+        flowId?: string
+      } = {}
       if (args.content !== undefined) {
         const admitted = admitContent(args.content, config.maxContentLength)
         if (!admitted.ok) throw new Error(admitted.message)
         patch.content = admitted.content
       }
-      if (args.depends_on !== undefined) {
-        patch.dependencies = (args.depends_on as string[]).map(id => TaskId(id))
+      if (args.dependencies !== undefined) {
+        patch.dependencies = (args.dependencies as string[]).map(id => TaskId(id))
+      }
+      if (args.acceptance_criteria !== undefined) {
+        const admitted = admitContent(args.acceptance_criteria, 2000)
+        if (!admitted.ok) throw new Error(admitted.message)
+        patch.acceptanceCriteria = admitted.content
+      }
+      if (args.flow_id !== undefined) {
+        const flow = ledger.getFlow(args.flow_id)
+        if (flow === undefined) throw new Error(`no such flow "${args.flow_id}"`)
+        patch.flowId = flow.id
       }
       const edited = await ledger.editTask(taskId, patch)
       if (!edited.ok) throw new Error(edited.message)
@@ -697,7 +869,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       status: {
         type: 'string',
         enum: [
-          'submitted', 'working', 'input-required', 'auth-required',
+          'queued', 'submitted', 'working', 'input-required', 'auth-required',
           'completed', 'failed', 'canceled', 'rejected',
         ],
         description: 'Optional: list only tasks in this state.',
@@ -719,6 +891,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
             outcome: { type: 'string' },
             reason: { type: 'string' },
             retries: { type: 'number', required: true },
+            acceptanceCriteria: { type: 'string' },
           },
         },
       },
@@ -773,6 +946,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
           from: { type: 'string', required: true },
           to: { type: 'string' },
           content: { type: 'string', required: true },
+          acceptanceCriteria: { type: 'string' },
           report: { type: 'string' },
           question: { type: 'string' },
           outcome: { type: 'string' },
@@ -955,11 +1129,12 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
   ctx.tools.register(defineTool({
     name: 'cancel_task',
     description:
-      'As the dispatcher, cancel a task you dispatched while it is still submitted, working, or '
-      + 'awaiting your input. The worker is interrupted, told the task is canceled, and asked to '
-      + 'report a summary of what it had done; the summary lands on the task (read it with get_task). '
-      + 'Only the session that dispatched a task may cancel it; workers cannot cancel their own '
-      + 'dispatched tasks.',
+      'As the dispatcher, cancel a task you dispatched while it is queued(待投递), submitted, '
+      + 'working, or awaiting your input. The worker is interrupted, told the task is canceled, and '
+      + 'asked to report a summary of what it had done; the summary lands on the task (read it with '
+      + 'get_task). A task that was never delivered (待投递) is canceled without bothering the '
+      + 'worker. Only the session that dispatched a task may cancel it; workers cannot cancel their '
+      + 'own dispatched tasks.',
     parameters: {
       task_id: { type: 'string', required: true, description: 'The ledger task id to cancel.' },
       reason: { type: 'string', description: 'Why the task is canceled, shown to the worker.' },
@@ -998,8 +1173,11 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
 
       // Interrupt the worker's in-flight turn, then ask for the summary. Both
       // are best-effort: an absent worker keeps the canceled row and the
-      // summary request is skipped.
-      const worker = task.assignedTo !== undefined ? ctx.agents.get(task.assignedTo) : undefined
+      // summary request is skipped. A queued task was never delivered, so its
+      // worker has nothing to summarize — cancel quietly.
+      const worker = task.assignedTo !== undefined && task.status !== 'queued'
+        ? ctx.agents.get(task.assignedTo)
+        : undefined
       if (worker !== undefined) {
         try {
           worker.cancel({ kind: 'user' }, { keepInbox: true })
@@ -1021,7 +1199,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
     description:
       'As the worker, pause a task you are working on because you need information only the '
       + 'dispatcher has. The task enters input-required with your question; the dispatcher answers '
-      + 'with dispatch_task passing task_id, and the task resumes when the answer arrives. Keep the '
+      + 'with create_task passing task_id, and the task resumes when the answer arrives. Keep the '
       + 'question specific so one round-trip suffices.',
     parameters: {
       task_id: { type: 'string', required: true, description: 'The working ledger task id.' },

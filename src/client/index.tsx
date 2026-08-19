@@ -22,7 +22,12 @@ export const inject = ['slots', 'sessions']
 /** Every model-facing tool this plugin renders in collapsed form. */
 const AGENT_BUS_TOOLS = [
   'list_peers',
+  'send_note',
+  'create_flow',
+  'list_flows',
+  'create_task',
   'dispatch_task',
+  'edit_task',
   'list_tasks',
   'get_task',
   'report_task',

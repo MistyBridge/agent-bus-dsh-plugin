@@ -37,7 +37,7 @@ import { ReportStore } from './external.ts'
 import { TaskLedger } from './ledger.ts'
 import { buildPanelSnapshot } from './panel.ts'
 import { DispatchRateLimiter } from './rate-limit.ts'
-import { dispatchReadyTasks, releaseDependents } from './scheduler.ts'
+import { dispatchOne, dispatchReadyTasks, releaseDependents } from './scheduler.ts'
 import { notifySession, registerAgentBusTools, type ToolsConfig } from './tools.ts'
 import { TaskId } from './types.ts'
 
@@ -85,22 +85,22 @@ export const Config: z<Config> = z.object({
 /** The model-facing usage policy. */
 const USAGE_TEXT = `You share a workspace with other agent sessions and can dispatch work to them.
 
-- list_peers shows the live sessions in your workspace: their names, their self-declared cards, and how busy they are. They are the only valid dispatch_task and send_note targets.
+- list_peers shows the live sessions in your workspace: their names, their self-declared cards, and how busy they are. They are the only valid create_task and send_note targets.
 - send_note sends a lightweight note to one peer: a message, a question, a confirmation — anything that is NOT work the peer must deliver a verifiable result for. There is NO task record, NO acceptance, and nothing to report or settle; the peer simply replies in prose, and if it replies it sends a note back to you. When a note you receive carries the <dsh-agent-bus-message> header, treat it as ordinary conversation, not work.
-- dispatch_task dispatches one task to one peer. Use it only for work that must produce a verifiable result: a chat disguised as a task is how tasks get stuck forever in working, because a task waits for report_task and settle_task while a chat expects none. The peer works its queued tasks one at a time, each as its own turn, and only starts the next one after finishing the current one — you do not need to pace dispatches. Passing task_id answers a peer's request_input and lets its paused task resume. Passing reviewer names a different session as the one that settles the result; without it you settle it yourself.
+- create_task creates one task node for a live peer. Use it only for work that must produce a verifiable result: a chat disguised as a task is how tasks get stuck forever in working, because a task waits for report_task and settle_task while a chat expects none. The peer works its delivered tasks one at a time, each as its own turn — you do not need to pace dispatches. dependencies names task ids that must settle before this one is delivered: while any predecessor is unsettled the task stays 待投递(queued) and the scheduler delivers it automatically once every dependency settles. acceptance_criteria states the minimum requirement the reviewer settles against. Passing task_id answers a peer's request_input and lets its paused task resume. Passing reviewer names a different session as the one that settles the result; without it you settle it yourself.
 - list_tasks with scope=inbox shows the ACTIVE work assigned to you, in the order you will do it. With scope=outbox it shows what you initiated. Archived tasks are invisible by design: a task leaves the listing once it failed, was canceled, or its settlement is more than 24 hours old — history lives in the panel and session logs. Completed tasks awaiting your verdict are still active and carry the worker's report, so read it before settling. Pass status to filter.
 - get_task reads one task's full record, including the complete report and question text.
 - report_task is the worker's way to finish: a working task becomes completed and the reviewer is notified to settle it. If the task was canceled, report_task attaches your work summary instead.
 - settle_task is the reviewer's verdict: success accepts and the task is done; failure sends the SAME task back to the worker for rework with your feedback as the instruction — the task id never changes across attempts, and the worker is notified automatically. The initiator is notified of the final result.
 - When you receive a notice that a task you review is completed, settle it promptly; leaving it unsettled stalls the worker.
-- When you receive a notice that a task you initiated timed out, decide whether to redo it with a new dispatch_task; a timeout means the worker never finished or never answered.
+- When you receive a notice that a task you initiated timed out, decide whether to redo it with a new create_task; a timeout means the worker never finished or never answered.
 - cancel_task is the initiator's way to stop a task that is still submitted, working, or awaiting input. The worker is interrupted and asked for a summary, which lands on the canceled task.
-- request_input pauses a task you are working on when you need information only the initiator has; they answer with dispatch_task passing task_id.
+- request_input pauses a task you are working on when you need information only the initiator has; they answer with create_task passing task_id.
 - update_card maintains your own capability card: a description for other agents and machine-readable capabilities for routing.
-- To orchestrate a flow, split the work into tasks and dispatch them with depends_on: each task names the tasks that must settle before it. A task with unsettled dependencies is only created — the scheduler dispatches it automatically once its dependencies settle, and failure propagates down the chain automatically when a dependency fails terminally. edit_task rewrites an undispatched task's requirement or dependencies if the DAG turns out wrong.
+- To orchestrate a flow, split the work into tasks and create them with dependencies: each task names the tasks that must settle before it is delivered. A task with unsettled dependencies is created 待投递(queued) — the scheduler delivers it automatically once every dependency settles, and failure propagates down the chain automatically when a dependency fails terminally. edit_task rewrites an undispatched task's requirement, acceptance criteria, or dependencies if the DAG turns out wrong.
 
 Incoming agent-bus messages open with a header naming the request kind, so read it first:
-- <dsh-agent-bus task="…" tool="dispatch_task" sender="…"> — a task to work; do it and call report_task with that task id.
+- <dsh-agent-bus task="…" tool="create_task" sender="…"> — a task to work; do it and call report_task with that task id.
 - <dsh-agent-bus task="…" tool="scheduler" sender="…"> — an auto-dispatched task (its dependencies settled); work it like any task.
 - <dsh-agent-bus task="…" tool="report_task" …> — a result you review is waiting; settle it promptly.
 - <dsh-agent-bus task="…" tool="settle_task" …> — on failure, rework the same task and report again; on success, the task is done.
@@ -109,9 +109,9 @@ Incoming agent-bus messages open with a header naming the request kind, so read 
 - <dsh-agent-bus-message tool="send_note" sender="…" id="…"> — a chat note, not a task; reply in prose if you wish, nothing to report or settle.
 Only the reviewer can settle and only the initiator can cancel, so never mark your own work complete.
 
-Delivery reaches live sessions only. A refusal from dispatch_task is authoritative: the peer is not reachable, not in your workspace, or its queue is full.
+Delivery reaches live sessions only. A refusal from create_task is authoritative: the peer is not reachable, not in your workspace, or its queue is full.
 
-Tools: list_peers, send_note, dispatch_task, edit_task, list_tasks, get_task, report_task, settle_task, cancel_task, request_input, update_card`
+Tools: list_peers, send_note, create_task, edit_task, list_tasks, get_task, report_task, settle_task, cancel_task, request_input, update_card`
 
 /**
  * Mount the gateway.
@@ -191,6 +191,68 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
         }
       },
     }), 'agent-bus: panel route')
+    // TaskChanged event stream (SSE) for the client event-driven scheduler.
+    // Every ledger mutation emits after the durable write; the panel holds
+    // one connection and drives dispatch decisions from these events.
+    ctx.effect(() => webServer.register({
+      kind: 'exact',
+      path: '/plugins/dsh-agent-bus/events',
+      handler: (req, res) => {
+        res.writeHead(200, {
+          'content-type': 'text/event-stream; charset=utf-8',
+          'cache-control': 'no-store',
+          connection: 'keep-alive',
+        })
+        res.write(': connected\n\n')
+        const listener = (event: unknown): void => {
+          res.write(`data: ${JSON.stringify(event)}\n\n`)
+        }
+        const dispose = ctx.on('agent-bus/task-changed', listener)
+        req.on('close', dispose)
+      },
+    }), 'agent-bus: events route')
+    // Dispatch endpoint: the client scheduler posts a queued task id once its
+    // dependencies have all settled. Idempotent — dispatchOne skips any task
+    // that is no longer queued, so concurrent posts and the server backstop
+    // sweep can race safely.
+    ctx.effect(() => webServer.register({
+      kind: 'exact',
+      path: '/plugins/dsh-agent-bus/dispatch',
+      handler: async (req, res) => {
+        const send = (status: number, body: object): void => {
+          res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+          res.end(JSON.stringify(body))
+        }
+        try {
+          if (req.method !== 'POST') {
+            send(405, { error: 'method-not-allowed' })
+            return
+          }
+          const chunks: Buffer[] = []
+          for await (const chunk of req) chunks.push(chunk as Buffer)
+          const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')) as { taskId?: unknown }
+          if (typeof parsed.taskId !== 'string' || parsed.taskId === '') {
+            send(400, { error: 'taskId required' })
+            return
+          }
+          const taskId = TaskId(parsed.taskId)
+          const task = ledger.get(taskId)
+          if (task === undefined) {
+            send(404, { error: 'no such task' })
+            return
+          }
+          if (task.status !== 'queued') {
+            // Idempotent no-op: already delivered or terminal.
+            send(200, { taskId: String(taskId), status: task.status, dispatched: false })
+            return
+          }
+          await dispatchOne(ctx, ledger, taskId)
+          send(200, { taskId: String(taskId), status: 'submitted', dispatched: true })
+        } catch (error: unknown) {
+          send(500, { error: String(error) })
+        }
+      },
+    }), 'agent-bus: dispatch route')
   }
   registerWebSurface()
   ctx.on('internal/service', (name) => {

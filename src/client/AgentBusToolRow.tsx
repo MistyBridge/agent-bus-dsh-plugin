@@ -18,7 +18,12 @@ import type { ToolCallViewProps } from '@deepseek-ai/dsh-client-ui-tool/client'
 /** Act labels per wire tool name, kept short for the collapsed line. */
 const ACT_LABELS: Record<string, string> = {
   list_peers: '发现 peer',
+  send_note: '发送消息',
+  create_flow: '创建流程',
+  list_flows: '流程列表',
+  create_task: '创建任务',
   dispatch_task: '派发任务',
+  edit_task: '改任务',
   list_tasks: '任务列表',
   get_task: '读取任务',
   report_task: '提交结果',

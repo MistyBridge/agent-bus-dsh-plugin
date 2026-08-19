@@ -7,8 +7,9 @@
  * @module dsh-agent-bus/client/panel-model
  */
 
-/** A2A TaskState vocabulary, mirrored so the client never imports the host module. */
+/** Task vocabulary, mirrored so the client never imports the host module. */
 export type TaskStatus =
+  | 'queued'
   | 'submitted'
   | 'working'
   | 'input-required'
@@ -73,6 +74,10 @@ export interface TaskView {
   readonly archived?: boolean
   /** DAG predecessors (task ids), in declaration order; empty when none. */
   readonly dependencies: readonly string[]
+  /** Dispatcher's minimum acceptance requirement; null when unset. */
+  readonly acceptanceCriteria: string | null
+  /** Owning flow id (v1.4); null when the task belongs to no flow. */
+  readonly flowId: string | null
   /** Tasks that depend on this one (reverse edges for the DAG view). */
   readonly dependents: readonly string[]
   /** Unsettled dependencies; empty means the task is ready to dispatch. */
@@ -87,6 +92,7 @@ export interface TaskView {
 
 /** Status counters, isomorphic with the host snapshot `stats` object. */
 export interface StatsView {
+  readonly queued: number
   readonly submitted: number
   readonly working: number
   readonly 'input-required': number
@@ -101,6 +107,19 @@ export interface WorkspaceView {
   readonly id: string
   readonly title: string
   readonly path: string
+}
+
+/** One flow in the snapshot directory: a named DAG container (v1.4). */
+export interface FlowView {
+  readonly id: string
+  readonly name: string
+  readonly description: string | null
+  readonly workspacePath: string
+  readonly taskCount: number
+  /** Tasks still in the active set (not archived). */
+  readonly unsettledCount: number
+  /** Derived: every task in the flow has archived. */
+  readonly archived: boolean
 }
 
 /** One session in the snapshot directory. */
@@ -118,6 +137,7 @@ export interface PanelSnapshot {
   readonly workspaces: readonly WorkspaceView[]
   readonly sessions: readonly SessionView[]
   readonly tasks: readonly TaskView[]
+  readonly flows: readonly FlowView[]
   readonly stats: StatsView
 }
 
@@ -130,6 +150,7 @@ const DAY_MS = 24 * HOUR_MS
 const WEEK_MS = 7 * DAY_MS
 
 const EMPTY_STATS: StatsView = {
+  queued: 0,
   submitted: 0,
   working: 0,
   'input-required': 0,
@@ -258,6 +279,7 @@ export function statsOf(tasks: readonly TaskView[]): StatsView {
   for (const task of tasks) {
     next.total += 1
     switch (task.status) {
+      case 'queued':
       case 'submitted':
       case 'working':
       case 'input-required':
@@ -420,6 +442,7 @@ export function formatNumber(n: number): string {
  */
 export function statusLabel(status: TaskStatus, outcome?: TaskOutcome | null): string {
   switch (status) {
+    case 'queued': return '待投递'
     case 'submitted': return '待执行'
     case 'working': return '进行中'
     case 'input-required': return '等待输入'
@@ -443,6 +466,7 @@ export function statusTone(status: TaskStatus, outcome?: TaskOutcome | null): To
     case 'input-required': return 'warning'
     case 'completed': return outcome === 'success' || outcome === 'failure' ? 'success' : 'warning'
     case 'failed': return 'danger'
+    case 'queued':
     case 'submitted':
     case 'canceled':
     case 'archived':
@@ -545,10 +569,324 @@ const EMPTY_SNAPSHOT: PanelSnapshot = {
   workspaces: [],
   sessions: [],
   tasks: [],
+  flows: [],
   stats: EMPTY_STATS,
 }
 
 /** Empty snapshot used before the first successful poll (and on hard failure). */
 export function emptySnapshot(): PanelSnapshot {
   return EMPTY_SNAPSHOT
+}
+
+/** One node in the workspace DAG: the task plus its topological depth. */
+export interface DagNode {
+  readonly task: TaskView
+  readonly depth: number
+}
+
+/** A directed edge: `from` is the predecessor, `to` is the dependent. */
+export interface DagEdge {
+  readonly from: string
+  readonly to: string
+}
+
+/** Laid-out box for one DAG node (compact layered placement). */
+export interface DagBox {
+  readonly id: string
+  readonly task: TaskView
+  readonly depth: number
+  readonly x: number
+  readonly y: number
+  readonly w: number
+  readonly h: number
+}
+
+export const DAG_NODE_W = 168
+export const DAG_NODE_H = 58
+export const DAG_GAP_X = 56
+export const DAG_GAP_Y = 18
+export const DAG_PAD = 20
+
+function predecessorsOf(task: TaskView): readonly string[] {
+  return task.dependencies ?? []
+}
+
+function successorsOf(task: TaskView): readonly string[] {
+  return task.dependents ?? []
+}
+
+function reaches(from: string, target: string, adj: ReadonlyMap<string, readonly string[]>): boolean {
+  const stack = [from]
+  const seen = new Set<string>()
+  while (stack.length > 0) {
+    const current = stack.pop()
+    if (current === undefined) break
+    if (current === target) return true
+    if (seen.has(current)) continue
+    seen.add(current)
+    const next = adj.get(current)
+    if (next === undefined) continue
+    for (const id of next) stack.push(id)
+  }
+  return false
+}
+
+/**
+ * Build the workspace DAG: nodes keep topological depth (longest path from
+ * a root); edges run predecessor → dependent. Cycles are skipped defensively
+ * (the ledger already rejects them on write). Isolated tasks sit at depth 0.
+ */
+export function dagOf(tasks: readonly TaskView[]): { nodes: DagNode[]; edges: DagEdge[] } {
+  const byId = new Map(tasks.map(task => [task.id, task]))
+  const adj = new Map<string, string[]>()
+  const incoming = new Map<string, string[]>()
+  const edges: DagEdge[] = []
+
+  const ordered = [...tasks].sort((left, right) => {
+    const created = left.createdAt.localeCompare(right.createdAt)
+    return created !== 0 ? created : left.id.localeCompare(right.id)
+  })
+
+  for (const task of ordered) {
+    for (const dep of predecessorsOf(task)) {
+      if (dep === task.id || !byId.has(dep)) continue
+      if (reaches(task.id, dep, adj)) continue
+      const tos = adj.get(dep)
+      if (tos === undefined) adj.set(dep, [task.id])
+      else tos.push(task.id)
+      const froms = incoming.get(task.id)
+      if (froms === undefined) incoming.set(task.id, [dep])
+      else froms.push(dep)
+      edges.push({ from: dep, to: task.id })
+    }
+  }
+
+  const depth = new Map<string, number>()
+  const walk = (id: string, stack: Set<string>): number => {
+    const cached = depth.get(id)
+    if (cached !== undefined) return cached
+    if (stack.has(id)) return 0
+    stack.add(id)
+    const preds = incoming.get(id) ?? []
+    let next = 0
+    if (preds.length > 0) {
+      next = 1
+      for (const pred of preds) {
+        const candidate = walk(pred, stack) + 1
+        if (candidate > next) next = candidate
+      }
+    }
+    stack.delete(id)
+    depth.set(id, next)
+    return next
+  }
+
+  const nodes = tasks.map(task => ({ task, depth: walk(task.id, new Set()) }))
+  return { nodes, edges }
+}
+
+/**
+ * Compact layered layout: one column per depth, rows packed by createdAt.
+ */
+export function layoutDag(
+  graph: { readonly nodes: readonly DagNode[]; readonly edges: readonly DagEdge[] },
+  opts?: {
+    readonly nodeW?: number
+    readonly nodeH?: number
+    readonly gapX?: number
+    readonly gapY?: number
+    readonly pad?: number
+  },
+): { boxes: DagBox[]; width: number; height: number } {
+  const nodeW = opts?.nodeW ?? DAG_NODE_W
+  const nodeH = opts?.nodeH ?? DAG_NODE_H
+  const gapX = opts?.gapX ?? DAG_GAP_X
+  const gapY = opts?.gapY ?? DAG_GAP_Y
+  const pad = opts?.pad ?? DAG_PAD
+
+  const columns = new Map<number, DagNode[]>()
+  let maxDepth = 0
+  for (const node of graph.nodes) {
+    if (node.depth > maxDepth) maxDepth = node.depth
+    const column = columns.get(node.depth)
+    if (column === undefined) columns.set(node.depth, [node])
+    else column.push(node)
+  }
+  for (const column of columns.values()) {
+    column.sort((left, right) => {
+      const created = left.task.createdAt.localeCompare(right.task.createdAt)
+      return created !== 0 ? created : left.task.id.localeCompare(right.task.id)
+    })
+  }
+
+  const boxes: DagBox[] = []
+  let height = pad * 2
+  for (const [depth, column] of columns) {
+    column.forEach((node, index) => {
+      const y = pad + index * (nodeH + gapY)
+      boxes.push({
+        id: node.task.id,
+        task: node.task,
+        depth,
+        x: pad + depth * (nodeW + gapX),
+        y,
+        w: nodeW,
+        h: nodeH,
+      })
+      const bottom = y + nodeH + pad
+      if (bottom > height) height = bottom
+    })
+  }
+
+  const width = graph.nodes.length === 0
+    ? pad * 2
+    : pad * 2 + (maxDepth + 1) * nodeW + maxDepth * gapX
+  return { boxes, width, height }
+}
+
+/**
+ * Walk the dependency cone of one task. Upstream follows `dependencies`,
+ * downstream follows `dependents`. The focus node itself is omitted.
+ */
+export function dependencyChainOf(
+  taskId: string,
+  nodes: readonly DagNode[],
+): { upstream: TaskView[]; downstream: TaskView[] } {
+  const byId = new Map(nodes.map(node => [node.task.id, node.task]))
+  const walk = (start: string, nextOf: (task: TaskView) => readonly string[]): TaskView[] => {
+    const out: TaskView[] = []
+    const seen = new Set<string>([start])
+    const stack = [start]
+    while (stack.length > 0) {
+      const current = stack.pop()
+      if (current === undefined) break
+      const task = byId.get(current)
+      if (task === undefined) continue
+      for (const id of nextOf(task)) {
+        if (seen.has(id)) continue
+        seen.add(id)
+        const next = byId.get(id)
+        if (next === undefined) continue
+        out.push(next)
+        stack.push(id)
+      }
+    }
+    return out
+  }
+  return {
+    upstream: walk(taskId, predecessorsOf),
+    downstream: walk(taskId, successorsOf),
+  }
+}
+
+/**
+ * Client-side blockedBy: a predecessor is satisfied only when it settled
+ * with `outcome === 'success'`. Missing ids stay blocking.
+ */
+export function blockedByOf(task: TaskView, tasks: readonly TaskView[]): readonly string[] {
+  const byId = new Map(tasks.map(item => [item.id, item]))
+  return predecessorsOf(task).filter(id => {
+    const dep = byId.get(id)
+    if (dep === undefined) return true
+    return !(dep.status === 'completed' && dep.outcome === 'success')
+  })
+}
+
+/**
+ * Readable copy for a failure that the scheduler propagated down the DAG.
+ * Other reasons stay `null` so the view does not invent a dependency badge.
+ */
+export function failureReasonOf(task: TaskView): string | null {
+  if (task.reason === 'dependency-failed') return '依赖失败'
+  if (task.reason === 'dependency-canceled') return '依赖已取消'
+  return null
+}
+
+/** True when any declared predecessor is terminally failed or canceled. */
+export function hasFailedDependency(task: TaskView, tasks: readonly TaskView[]): boolean {
+  const byId = new Map(tasks.map(item => [item.id, item]))
+  return predecessorsOf(task).some(id => {
+    const dep = byId.get(id)
+    return dep !== undefined && (dep.status === 'failed' || dep.status === 'canceled')
+  })
+}
+
+/**
+ * @deprecated v1.4 uses the explicit `queued` status. Kept for older tests.
+ */
+export function isReadyUndelivered(task: TaskView, tasks: readonly TaskView[]): boolean {
+  return task.status === 'queued' && blockedByOf(task, tasks).length === 0
+}
+
+/** Flows of one workspace: active first, then archived. */
+export function flowsOfWorkspace(
+  flows: readonly FlowView[],
+  workspacePath: string | null,
+): FlowView[] {
+  const scoped = workspacePath === null
+    ? [...flows]
+    : flows.filter(flow => flow.workspacePath === workspacePath)
+  return scoped.sort((left, right) => Number(left.archived) - Number(right.archived))
+}
+
+/** Tasks that belong to one flow. Flow-less rows never appear in a DAG. */
+export function tasksOfFlow(tasks: readonly TaskView[], flowId: string | null): TaskView[] {
+  if (flowId === null) return []
+  return tasks.filter(task => task.flowId === flowId)
+}
+
+/**
+ * The DAG's archive rule (v1.4 §6): a terminal failure/cancel/reject leaves
+ * the active set IMMEDIATELY, and a settled success leaves after the 24h
+ * archive phase. This mirrors the flow-archived derivation (panel flows
+ * directory) and the tools' isActiveTask, so a faded node, the flow list,
+ * and the agent-visible set never disagree about what is archived.
+ */
+export function isDagArchived(task: TaskView): boolean {
+  if (task.status === 'failed' || task.status === 'canceled' || task.status === 'rejected') {
+    return true
+  }
+  return isArchived(task)
+}
+
+/**
+ * v1.4 §6.1: active tasks plus every recursive predecessor, so an archived
+ * ancestor chain stays visible beside live work. Terminal-failed tasks are
+ * not anchors but still appear when an active task depends on them.
+ * Isolated archived tasks drop off the graph.
+ */
+export function visibleDagTasks(tasks: readonly TaskView[]): TaskView[] {
+  const byId = new Map(tasks.map(task => [task.id, task]))
+  const keep = new Set<string>()
+  const walk = (id: string): void => {
+    if (keep.has(id)) return
+    const task = byId.get(id)
+    if (task === undefined) return
+    keep.add(id)
+    for (const dep of predecessorsOf(task)) walk(dep)
+  }
+  for (const task of tasks) {
+    if (!isDagArchived(task)) walk(task.id)
+  }
+  return tasks.filter(task => keep.has(task.id))
+}
+
+/** Archived node on a live chain: faded, not interactive. */
+export function isDagFaded(task: TaskView): boolean {
+  return isDagArchived(task)
+}
+
+/** Queued with every predecessor settled — the client scheduler may POST /dispatch. */
+export function isReadyToDispatch(task: TaskView, tasks: readonly TaskView[]): boolean {
+  return task.status === 'queued' && blockedByOf(task, tasks).length === 0
+}
+
+/** Color of a node on a highlighted dependency chain. */
+export type ChainTone = 'ok' | 'wait' | 'fail'
+
+/** Upstream tone: settled success / still open / terminal failure. */
+export function chainToneOf(task: TaskView): ChainTone {
+  if (task.status === 'failed' || task.status === 'canceled') return 'fail'
+  if (task.status === 'completed' && task.outcome === 'success') return 'ok'
+  return 'wait'
 }

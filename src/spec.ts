@@ -56,6 +56,7 @@ export const taskRecord = z.object({
   workspacePath: z.string(),
   content: z.string(),
   status: z.enum([
+    'queued',
     'submitted',
     'working',
     'input-required',
@@ -78,6 +79,10 @@ export const taskRecord = z.object({
   tokensAtStart: z.record(sessionId, tokenBuckets).optional(),
   dependencies: z.array(taskId).max(16).optional(),
   auto: z.boolean().optional(),
+  /** Dispatcher's minimum acceptance requirement, the reviewer's settle basis. */
+  acceptanceCriteria: z.string().max(2000).optional(),
+  /** Owning flow id (v1.4): dependencies must stay inside the same flow. */
+  flowId: z.string().optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
 })
@@ -100,6 +105,22 @@ export const peerCard = z.object({
 export type StoredPeerCard = z.infer<typeof peerCard>
 
 /**
+ * Durable shape of one flow: a named DAG container for tasks (v1.4). A flow
+ * has no status of its own — active/archived is derived from its tasks.
+ */
+export const flowRecord = z.object({
+  id: z.string(),
+  name: z.string().min(1).max(80),
+  description: z.string().max(400).optional(),
+  createdBy: sessionId,
+  workspacePath: z.string(),
+  createdAt: z.string(),
+})
+
+/** One stored flow, inferred from {@link flowRecord}. */
+export type StoredFlowRecord = z.infer<typeof flowRecord>
+
+/**
  * Durable ledger state. `taskIds` is the authoritative creation order, which
  * the listing tools page over without scanning the table. Defaulted so a
  * record written before the field parses unchanged.
@@ -113,16 +134,16 @@ export type AgentBusDomainState = z.infer<typeof agentBusDomainState>
 
 /**
  * The agent-bus domain spec: a `tasks` table keyed by task id, a `peers`
- * table keyed by session id, plus the order singleton. Version 6 adds the DAG
- * fields (`dependencies`, `auto`) for flow orchestration; both are optional,
- * so rows written by v5 parse unchanged, but the version bump still
- * invalidates the storage unit — delete `agent_bus.json` once after
- * upgrading, the same pre-release discipline earlier versions followed. No
- * migration for pre-release data.
+ * table keyed by session id, a `flows` table keyed by flow id, plus the
+ * order singleton. Version 8 adds the flows container (`flows` table,
+ * `tasks.flowId`) for the v1.4 flow model. The version bump invalidates the
+ * storage unit — keep a backup of `agent_bus.json` first (v1.3 §6), then
+ * bump the version stamp once after upgrading; the ledger migrates
+ * pre-release `submitted` rows without a messageId to `queued` at open.
  */
 export const agentBusDomainSpec = defineDomain({
   name: 'agent_bus',
-  version: 6,
+  version: 8,
   global: {
     schema: agentBusDomainState,
     initial: { taskIds: [] },
@@ -130,5 +151,6 @@ export const agentBusDomainSpec = defineDomain({
   tables: {
     tasks: domainTable<TaskId, StoredTaskRecord>(taskRecord),
     peers: domainTable<SessionId, StoredPeerCard>(peerCard),
+    flows: domainTable<string, StoredFlowRecord>(flowRecord),
   },
 })
