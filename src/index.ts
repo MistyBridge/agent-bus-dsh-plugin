@@ -232,7 +232,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       if (Date.now() - last < REMINDER_COOLDOWN_MS) continue
       lastReminder.set(key, Date.now())
       notifySession(ctx, session.id, task.id,
-        `任务 ${task.id} 的当前轮次已结束,但任务仍处于进行中。如果已经完成,请调用 report_task 提交结果;如果还需要继续处理,可以忽略本提醒。`,
+        `任务 ${task.id} 的当前轮次已结束,但任务仍处于进行中。如果已经完成,请调用 report_task 提交结果;如果还需要继续处理,可以忽略本提醒;如果该任务并不适合由你执行,也请调用 report_task 简述情况,由派发方验收或取消,避免任务长期滞留。`,
         'reminder')
       break
     }

@@ -95,7 +95,12 @@ function view(task: TaskRecord): TaskView {
  * @returns the text lines for one row.
  */
 export function renderTaskRow(t: TaskView): string {
-  const head = `${t.id} [${t.status}] ${t.content.slice(0, 80)}`
+  // A completed row without a verdict reads as 「待验收」 to the model, mirroring
+  // the panel badge — a status the reviewer must settle next.
+  const badge = t.status === 'completed' && t.outcome === undefined
+    ? 'completed 待验收'
+    : t.status
+  const head = `${t.id} [${badge}] ${t.content.slice(0, 80)}`
   const report = t.report !== undefined
     ? `\n  submitted result: ${t.report.slice(0, 400)}`
     : ''
@@ -832,7 +837,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         ? `${admitted.content.slice(0, 200)}…`
         : admitted.content
       notifySession(ctx, reviewer, taskId,
-        `任务 ${taskId} 已完成,请调用 settle_task 验收。提交结果摘要:${excerpt}`,
+        `任务 ${taskId} 已完成,当前状态为「待验收」,请调用 settle_task 验收。提交结果摘要:${excerpt}`,
         'report_task')
       return { taskId, status: completed.task.status }
     },
