@@ -48,7 +48,7 @@ export interface ToolsDeps {
   readonly ledger: TaskLedger
   readonly workspaces: WorkspaceRegistry
   readonly limiter: DispatchRateLimiter
-  /** Separate sliding window for send_message, so chatter cannot exhaust task quota. */
+  /** Separate sliding window for send_note, so chatter cannot exhaust task quota. */
   readonly messageLimiter: DispatchRateLimiter
   readonly reports: ReportStore
 }
@@ -375,19 +375,22 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
   }))
 
   ctx.tools.register(defineTool({
-    name: 'send_message',
+    // Named send_note, NOT send_message: the harness bundle reserves
+    // send_message globally for subagent conversation (dsh-tool-subagent-
+    // control), so the peer channel must not collide with it.
+    name: 'send_note',
     description:
-      'Send a lightweight message to a live peer in your workspace: a note, a question, a '
+      'Send a lightweight note to a live peer in your workspace: a message, a question, a '
       + 'confirmation, a coordination ping — anything that is NOT work the peer must deliver a '
-      + 'verifiable result for. The message lands in the peer\'s inbox like an ordinary message; '
+      + 'verifiable result for. The note lands in the peer\'s inbox like an ordinary message; '
       + 'there is NO task record, no acceptance, and nothing to report or settle. The peer simply '
-      + 'replies in prose (with send_message back to you, if it replies at all). Use dispatch_task '
-      + 'instead when the peer must produce a result you will verify — a message channel needs no '
+      + 'replies in prose (with send_note back to you, if it replies at all). Use dispatch_task '
+      + 'instead when the peer must produce a result you will verify — a note channel needs no '
       + 'lifecycle, and a task channel whose work was really a chat is how tasks get stuck forever '
       + 'in working.',
     parameters: {
       target: { type: 'string', required: true, description: 'Session id of the peer, from list_peers.' },
-      content: { type: 'string', required: true, description: 'The message text.' },
+      content: { type: 'string', required: true, description: 'The note text.' },
     },
     output: {
       schema: {
@@ -401,14 +404,14 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       render: (_args, result) => [{
         type: 'text',
         text: result.delivered
-          ? `message delivered (${String(result.messageId).slice(0, 8)}…)`
-          : 'message not delivered',
+          ? `note delivered (${String(result.messageId).slice(0, 8)}…)`
+          : 'note not delivered',
       }],
     },
     presentCall: (args) => ({ card: 'generic', title: 'agent-bus:发送消息', kind: 'other', rawInput: { target: args.target } }),
     presentResult: (_args, result) => ({ card: 'generic', title: 'agent-bus:发送消息', rawInput: result }),
     async execute(args, exec) {
-      const callerId = requireCaller(exec.agent, 'send_message')
+      const callerId = requireCaller(exec.agent, 'send_note')
       if (!deps.messageLimiter.admit(callerId, Date.now())) {
         throw new Error(
           `message rate exceeded: at most ${config.maxMessagesPerMinute} messages per minute`,
@@ -419,7 +422,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       if (!decision.ok) throw new Error(decision.message)
       const admitted = admitContent(args.content, config.maxContentLength)
       if (!admitted.ok) throw new Error(admitted.message)
-      // No ledger write: a message has no row, so the claimed-listener cannot
+      // No ledger write: a note has no row, so the claimed-listener cannot
       // match it and no lifecycle ever starts. The message id is generated
       // here and returned so the sender keeps a delivery receipt.
       const message = buildMessageMessage(callerId, randomUUID(), admitted.content)

@@ -85,8 +85,8 @@ export const Config: z<Config> = z.object({
 /** The model-facing usage policy. */
 const USAGE_TEXT = `You share a workspace with other agent sessions and can dispatch work to them.
 
-- list_peers shows the live sessions in your workspace: their names, their self-declared cards, and how busy they are. They are the only valid dispatch_task and send_message targets.
-- send_message sends a lightweight message to one peer: a note, a question, a confirmation — anything that is NOT work the peer must deliver a verifiable result for. There is NO task record, NO acceptance, and nothing to report or settle; the peer simply replies in prose, and if it replies it sends a message back to you. When a message you receive carries the <dsh-agent-bus-message> header, treat it as ordinary conversation, not work.
+- list_peers shows the live sessions in your workspace: their names, their self-declared cards, and how busy they are. They are the only valid dispatch_task and send_note targets.
+- send_note sends a lightweight note to one peer: a message, a question, a confirmation — anything that is NOT work the peer must deliver a verifiable result for. There is NO task record, NO acceptance, and nothing to report or settle; the peer simply replies in prose, and if it replies it sends a note back to you. When a note you receive carries the <dsh-agent-bus-message> header, treat it as ordinary conversation, not work.
 - dispatch_task dispatches one task to one peer. Use it only for work that must produce a verifiable result: a chat disguised as a task is how tasks get stuck forever in working, because a task waits for report_task and settle_task while a chat expects none. The peer works its queued tasks one at a time, each as its own turn, and only starts the next one after finishing the current one — you do not need to pace dispatches. Passing task_id answers a peer's request_input and lets its paused task resume. Passing reviewer names a different session as the one that settles the result; without it you settle it yourself.
 - list_tasks with scope=inbox shows work assigned to you, in the order you will do it. With scope=outbox it shows what you initiated: completed tasks carry the worker's report, waiting for the reviewer's verdict. Pass status to filter.
 - get_task reads one task's full record, including the complete report and question text.
@@ -106,12 +106,12 @@ Incoming agent-bus messages open with a header naming the request kind, so read 
 - <dsh-agent-bus task="…" tool="settle_task" …> — on failure, rework the same task and report again; on success, the task is done.
 - <dsh-agent-bus task="…" tool="cancel_task" …> — your task was canceled; report a summary of what you had done.
 - <dsh-agent-bus task="…" tool="reminder|timeout" …> — a system notice; it needs no separate action, only your report if you still owe one.
-- <dsh-agent-bus-message tool="send_message" sender="…" id="…"> — a chat message, not a task; reply in prose if you wish, nothing to report or settle.
+- <dsh-agent-bus-message tool="send_note" sender="…" id="…"> — a chat note, not a task; reply in prose if you wish, nothing to report or settle.
 Only the reviewer can settle and only the initiator can cancel, so never mark your own work complete.
 
 Delivery reaches live sessions only. A refusal from dispatch_task is authoritative: the peer is not reachable, not in your workspace, or its queue is full.
 
-Tools: list_peers, send_message, dispatch_task, edit_task, list_tasks, get_task, report_task, settle_task, cancel_task, request_input, update_card`
+Tools: list_peers, send_note, dispatch_task, edit_task, list_tasks, get_task, report_task, settle_task, cancel_task, request_input, update_card`
 
 /**
  * Mount the gateway.
