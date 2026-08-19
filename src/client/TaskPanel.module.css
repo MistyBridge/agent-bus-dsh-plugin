@@ -1053,8 +1053,8 @@ html[data-agent-bus-panel-open] .abPPreview {
 .abPDagCanvas {
   position: relative;
   min-width: 0;
-  min-height: 160px;
-  flex: 1;
+  min-height: 72px;
+  flex: 1 1 42%;
   overflow: hidden;
   cursor: grab;
   touch-action: none;
@@ -1282,13 +1282,37 @@ html[data-agent-bus-panel-open] .abPPreview {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  flex: 1 1 42%;
-  min-height: 200px;
-  max-height: 58%;
-  overflow: auto;
-  padding: 10px 12px 14px;
+  min-height: 0;
+  flex: 1 1 58%;
+  max-height: 70%;
+  overflow: hidden;
+  padding: 10px 12px 12px;
   border-top: 1px solid var(--dsw-alias-border-l2);
   background: var(--dsw-alias-bg-layer-1);
+}
+
+.abPReq {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 6.5em;
+  flex: 1 1 auto;
+  overflow: auto;
+}
+
+.abPReq .abPContent {
+  min-height: 3.5em;
+  max-height: none;
+}
+
+.abPDagMore {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 38%;
+  overflow: auto;
 }
 
 .abPDagDetail .abPContent,

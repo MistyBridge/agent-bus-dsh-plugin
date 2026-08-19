@@ -207,14 +207,17 @@ function TaskDetail({
       {task.blockedBy.length > 0 && (
         <div className="abPTaskMeta">{`等待依赖 ${task.blockedBy.join(' · ')}`}</div>
       )}
-      <div className="abPStaffHead">任务要求</div>
-      <pre className="abPContent">{task.content}</pre>
-      {criteria !== null && criteria !== '' && (
-        <>
-          <div className="abPStaffHead">验收标准</div>
-          <pre className="abPContent">{criteria}</pre>
-        </>
-      )}
+      <div className="abPReq">
+        <div className="abPStaffHead">任务要求</div>
+        <pre className="abPContent">{task.content}</pre>
+        {criteria !== null && criteria !== '' && (
+          <>
+            <div className="abPStaffHead">验收标准</div>
+            <pre className="abPContent">{criteria}</pre>
+          </>
+        )}
+      </div>
+      <div className="abPDagMore">
       <div className="abPStaffHead">
         本任务合计
         {hasUnreadableTokens(task.staff) ? ' · 部分会话不可读' : ''}
@@ -248,6 +251,7 @@ function TaskDetail({
           {zone}
         </div>
       )}
+      </div>
     </article>
   )
 }
