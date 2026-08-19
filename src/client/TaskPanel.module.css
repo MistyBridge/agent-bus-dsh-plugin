@@ -1167,10 +1167,11 @@ html[data-agent-bus-panel-open] .abPPreview {
   flex-direction: column;
   justify-content: center;
   gap: 2px;
-  padding: 8px 10px;
+  height: 64px;
+  padding: 6px 8px;
   overflow: hidden;
   border: 1px solid var(--dsw-alias-border-l2);
-  border-radius: 10px;
+  border-radius: 8px;
   background: var(--dsw-alias-bg-layer-2);
   color: inherit;
   font: inherit;
@@ -1281,16 +1282,18 @@ html[data-agent-bus-panel-open] .abPPreview {
   display: flex;
   flex-direction: column;
   gap: 8px;
-  flex: none;
-  max-height: min(240px, 32%);
+  flex: 1 1 42%;
+  min-height: 200px;
+  max-height: 58%;
   overflow: auto;
-  padding: 10px 12px;
+  padding: 10px 12px 14px;
   border-top: 1px solid var(--dsw-alias-border-l2);
   background: var(--dsw-alias-bg-layer-1);
 }
 
-.abPDagDetail .abPContent {
-  max-height: 72px;
+.abPDagDetail .abPContent,
+.abPFloat .abPContent {
+  max-height: none;
 }
 
 .abPDagFail {

@@ -412,7 +412,7 @@ export function callSteps(task: TaskView): CallStep[] {
         : task.question !== null && task.question !== ''
           ? task.question
           : '提交验收')
-      : task.contentPreview
+      : '派发'
     steps.push({ from, to, summary })
   }
   return steps
@@ -601,8 +601,8 @@ export interface DagBox {
   readonly h: number
 }
 
-export const DAG_NODE_W = 196
-export const DAG_NODE_H = 76
+export const DAG_NODE_W = 176
+export const DAG_NODE_H = 64
 export const DAG_GAP_X = 64
 export const DAG_GAP_Y = 22
 export const DAG_PAD = 20

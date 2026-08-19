@@ -104,6 +104,7 @@ Never use a heavier channel than the ask needs, and never a lighter one: chat-as
 - request_input pauses a task you are working on when you need information only the initiator has; they answer with create_task passing task_id.
 - update_card maintains your own capability card: a description for other agents and machine-readable capabilities for routing.
 - create_flow (LARGE) creates the roadmap container: plan first, then split the plan into tasks created with flow_id and dependencies. A task with unsettled dependencies is created 待投递(queued) — the scheduler delivers it automatically once every dependency settles, and failure propagates down the chain automatically when a dependency fails terminally. edit_task rewrites an undispatched task's requirement, acceptance criteria, dependencies, or flow membership if the DAG turns out wrong. The DAG view renders one flow at a time; flow-less tasks never appear there.
+- submit_handoff passes structured context DOWN a chain: when a task you executed settles, deliver each downstream task (one that lists your task in its dependencies) a handoff document — computed values, decisions, caveats. Dispatch concatenates those documents into the downstream task's content, so the next worker reads the chain's state instead of excavating old reports. You may also be the executor of your own task (target yourself) as long as a different session reviews it — nobody approves their own work.
 
 Incoming agent-bus messages open with a header naming the request kind, so read it first:
 - <dsh-agent-bus task="…" tool="create_task" sender="…"> — a task to work; do it and call report_task with that task id.
@@ -117,7 +118,7 @@ Only the reviewer can settle and only the initiator can cancel, so never mark yo
 
 Delivery reaches live sessions only. A refusal from create_task is authoritative: the peer is not reachable, not in your workspace, or its queue is full.
 
-Tools: list_peers, send_note, create_flow, create_task, edit_task, list_flows, list_tasks, get_task, report_task, settle_task, cancel_task, request_input, update_card`
+Tools: list_peers, send_note, create_flow, create_task, edit_task, submit_handoff, list_flows, list_tasks, get_task, report_task, settle_task, cancel_task, request_input, update_card`
 
 /**
  * Mount the gateway.
@@ -293,12 +294,18 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const REMINDER_COOLDOWN_MS = 15 * 60 * 1000
   ctx.on('session/event', (session, event) => {
     if (event.type !== 'turn/end') return
+    const now = Date.now()
     for (const task of ledger.listFor(session.id)) {
       if (task.status !== 'working') continue
       const key = String(task.id)
       const last = lastReminder.get(key) ?? 0
-      if (Date.now() - last < REMINDER_COOLDOWN_MS) continue
-      lastReminder.set(key, Date.now())
+      // Cooldown rides the TASK's own state, not process memory: a task that
+      // changed recently (the worker is clearly active on it) is never
+      // nagged, and a restart cannot cause an instant re-reminder of work
+      // the worker already reported — reported tasks are no longer working.
+      if (now - Date.parse(task.updatedAt) < REMINDER_COOLDOWN_MS) continue
+      if (now - last < REMINDER_COOLDOWN_MS) continue
+      lastReminder.set(key, now)
       notifySession(ctx, session.id, task.id,
         `任务 ${task.id} 当前状态「进行中」,本轮次已结束。若已完成,请调用 report_task 提交结果(进入「待验收」);若仍需继续处理,可忽略本提醒;若该任务并不适合由你执行,请调用 report_task 简述情况,由派发方验收或取消,避免任务长期滞留。`,
         'reminder')

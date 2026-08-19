@@ -184,6 +184,7 @@ function TaskDetail({
   const zone = reportZoneLabel(task.reportZone)
   const steps = callSteps(task)
   const propagated = failureReasonOf(task)
+  const criteria = task.acceptanceCriteria
   return (
     <article className="abPDagDetail">
       <div className="abPFloatTop">
@@ -191,7 +192,6 @@ function TaskDetail({
         <div className="abPTaskSummary">
           <div className="abPTaskLine">
             <StatusBadge task={task} />
-            <span className="abPFloatTitle">{task.contentPreview}</span>
           </div>
           <div className="abPTaskMeta">
             {`任务时间 ${relativeTime(task.updatedMs, nowMs)}`}
@@ -207,10 +207,14 @@ function TaskDetail({
       {task.blockedBy.length > 0 && (
         <div className="abPTaskMeta">{`等待依赖 ${task.blockedBy.join(' · ')}`}</div>
       )}
-      {task.acceptanceCriteria !== null && task.acceptanceCriteria !== '' && (
-        <div className="abPTaskMeta">{`验收标准 ${task.acceptanceCriteria}`}</div>
-      )}
+      <div className="abPStaffHead">任务要求</div>
       <pre className="abPContent">{task.content}</pre>
+      {criteria !== null && criteria !== '' && (
+        <>
+          <div className="abPStaffHead">验收标准</div>
+          <pre className="abPContent">{criteria}</pre>
+        </>
+      )}
       <div className="abPStaffHead">
         本任务合计
         {hasUnreadableTokens(task.staff) ? ' · 部分会话不可读' : ''}
