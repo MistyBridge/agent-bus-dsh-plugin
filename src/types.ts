@@ -20,7 +20,22 @@ declare module '@deepseek-ai/cordis' {
      * @mode emit
      */
     'agent-bus/settle'(taskId: string): void
+    /**
+     * A task's status or settlement changed (v1.4). Emitted AFTER the durable
+     * write; the client event-driven scheduler consumes this stream via SSE.
+     */
+    'agent-bus/task-changed'(change: TaskChangedEvent): void
   }
+}
+
+/** One TaskChanged event: a status/settlement change after the durable write. */
+export interface TaskChangedEvent {
+  readonly taskId: string
+  /** Prior status, or `-` for creation. */
+  readonly from: string
+  /** New status, settlement marker, or `edited`. */
+  readonly to: string
+  readonly at: string
 }
 
 /**
@@ -35,9 +50,13 @@ export function TaskId(value: string): TaskId {
 }
 
 /**
- * Task lifecycle, verbatim A2A TaskState vocabulary. Extensions never add
- * states; they ride {@link TaskRecord.reason} and friends.
+ * Task lifecycle: the A2A TaskState vocabulary plus one extension.
+ * `queued` is the pre-delivery phase of `submitted` — a task whose DAG
+ * predecessors are not all settled. Everything else is verbatim A2A;
+ * extensions ride {@link TaskRecord.reason} and friends.
  *
+ * - `queued` — created but not delivered; waiting for every dependency to
+ *   settle. The client event-driven scheduler dispatches it (v1.4).
  * - `submitted` — delivered to the worker, awaiting claim.
  * - `working` — claimed into a turn and executing.
  * - `input-required` — the worker asked the dispatcher for input; the task
@@ -51,6 +70,7 @@ export function TaskId(value: string): TaskId {
  * - `rejected` — reserved; no transition produces it yet.
  */
 export type TaskStatus =
+  | 'queued'
   | 'submitted'
   | 'working'
   | 'input-required'
@@ -101,6 +121,20 @@ export interface PeerCard {
   readonly capabilities: readonly Capability[]
   /** ISO-8601 stamp of the last update. */
   readonly updatedAt: string
+}
+
+/**
+ * One flow: a named DAG container for tasks (v1.4). The container has no
+ * status of its own — active/archived is derived from its tasks, so adding a
+ * task to an archived flow reactivates it automatically.
+ */
+export interface FlowRecord {
+  readonly id: string
+  readonly name: string
+  readonly description?: string
+  readonly createdBy: SessionId
+  readonly workspacePath: string
+  readonly createdAt: string
 }
 
 /**
@@ -155,6 +189,10 @@ export interface TaskRecord {
   readonly dependencies?: readonly TaskId[]
   /** Set when the scheduler auto-dispatched this task after its dependencies cleared. */
   readonly auto?: boolean
+  /** The dispatcher's minimum acceptance requirement (v1.4). */
+  readonly acceptanceCriteria?: string
+  /** Owning flow id (v1.4); dependencies must stay inside the same flow. */
+  readonly flowId?: string
   /** ISO-8601 creation stamp. */
   readonly createdAt: string
   /** ISO-8601 stamp of the last status change. */

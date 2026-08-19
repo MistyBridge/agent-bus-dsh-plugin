@@ -26,12 +26,14 @@ import type { DomainGlobal, KvTable } from '@deepseek-ai/dsh-storage-domain'
 import {
   agentBusDomainSpec,
   type AgentBusDomainState,
+  type StoredFlowRecord,
   type StoredPeerCard,
   type StoredTaskRecord,
 } from './spec.ts'
 import {
   TaskId,
   type DeliveryMode,
+  type FlowRecord,
   type PeerCard,
   type TaskOutcome,
   type TaskRecord,
@@ -45,6 +47,9 @@ import {
  * life across repeated attempts.
  */
 const ALLOWED_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]>> = {
+  // v1.4: queued is the pre-delivery phase — the scheduler transitions it to
+  // submitted on dispatch; failure propagation and cancel may close it early.
+  queued: ['submitted', 'failed', 'canceled'],
   submitted: ['working', 'failed', 'canceled'],
   working: ['completed', 'input-required', 'failed', 'canceled'],
   'input-required': ['working', 'failed', 'canceled'],
@@ -106,10 +111,21 @@ export interface NewTask {
   readonly tokensAtStart?: Record<string, TokenBuckets>
   /**
    * DAG predecessors. When non-empty and any predecessor is unsettled, the
-   * task is created WITHOUT delivery; the scheduler dispatches it once every
-   * predecessor settles (see `pendingReleases`).
+   * task is created as `queued` (待投递) WITHOUT delivery; the event-driven
+   * scheduler dispatches it once every predecessor settles (v1.4).
    */
   readonly dependencies?: readonly TaskId[]
+  /**
+   * The dispatcher's minimum acceptance requirement; the reviewer settles
+   * against it (v1.4).
+   */
+  readonly acceptanceCriteria?: string
+  /**
+   * Owning flow id (v1.4). When set, every dependency must belong to the
+   * same flow — a flow is a self-contained DAG and cross-container
+   * references are rejected at write time.
+   */
+  readonly flowId?: string
 }
 
 /** Maximum number of DAG predecessors one task may declare. */
@@ -153,6 +169,7 @@ export function validateDependencies(
   dependencies: readonly TaskId[] | undefined,
   all: readonly TaskRecord[],
   workspacePath: string,
+  flowId?: string,
 ): string | null {
   if (dependencies === undefined || dependencies.length === 0) return null
   if (dependencies.length > MAX_DEPENDENCIES) {
@@ -173,6 +190,12 @@ export function validateDependencies(
     }
     if (row.workspacePath !== workspacePath) {
       return `task "${taskId}" depends on "${dep}" from another workspace`
+    }
+    // A flow is a self-contained DAG: dependencies must live in the same
+    // flow, so cross-container references are impossible by construction.
+    // Add the target to the flow first (edit_task with flow_id), then depend.
+    if (flowId !== undefined && row.flowId !== flowId) {
+      return `task "${taskId}" belongs to flow "${flowId}" but depends on "${dep}" in ${row.flowId === undefined ? 'no flow' : `flow "${row.flowId}"`}; add it to the flow first`
     }
   }
   // Cycle check: the candidate edge set is the current table plus this
@@ -229,11 +252,17 @@ export type LedgerResult =
 export class TaskLedger {
   private table!: KvTable<TaskId, StoredTaskRecord>
   private peers!: KvTable<SessionId, StoredPeerCard>
+  private flows!: KvTable<string, StoredFlowRecord>
   private global!: DomainGlobal<AgentBusDomainState>
   private chain: Promise<unknown> = Promise.resolve()
+  private ctx!: Context
 
   /**
    * Open the ledger domain and bind its teardown to the plugin lifetime.
+   *
+   * Applies the v1.4 shape migration before the backup snapshot: a
+   * pre-release `submitted` row without a messageId is the old implicit
+   * "blocked, undelivered" form and becomes the explicit `queued` state.
    *
    * @param ctx - the plugin context, which must have `storageDomain` bound.
    * @returns the opened ledger.
@@ -242,11 +271,51 @@ export class TaskLedger {
     const ledger = new TaskLedger()
     const domain = await ctx.storageDomain.open(agentBusDomainSpec)
     ctx.effect(() => () => domain.close(), 'agent-bus.domainClose')
+    ledger.ctx = ctx
     ledger.table = domain.table('tasks')
     ledger.peers = domain.table('peers')
+    ledger.flows = domain.table('flows')
     ledger.global = domain.global
+    await ledger.migrateQueued()
     await ledger.snapshotBackup()
     return ledger
+  }
+
+  /**
+   * v1.4 shape migration: `submitted` without a messageId means "blocked,
+   * undelivered" in the pre-v7 row format; the explicit state is `queued`.
+   * Runs once at open, idempotently.
+   */
+  private async migrateQueued(): Promise<void> {
+    for (const row of this.listAll()) {
+      if (row.status !== 'submitted' || row.messageId !== undefined) continue
+      const migrated: StoredTaskRecord = {
+        ...row,
+        status: 'queued',
+        dependencies: row.dependencies !== undefined ? [...row.dependencies] : undefined,
+      }
+      await this.table.put(row.id, migrated)
+    }
+  }
+
+  /**
+   * Emit one TaskChanged event for the client event-driven scheduler.
+   *
+   * Emitted AFTER the durable write completes, so an event consumer never
+   * sees state the ledger has not yet recorded.
+   *
+   * @param taskId - the row that changed.
+   * @param from - prior status, or `-` for creation.
+   * @param to - new status, or a settlement marker (`settled-success`,
+   *   `settled-failure`) or `edited` for a mutation that keeps the status.
+   */
+  private emitChange(taskId: TaskId, from: string, to: string): void {
+    this.ctx.emit('agent-bus/task-changed', {
+      taskId: String(taskId),
+      from,
+      to,
+      at: new Date().toISOString(),
+    })
   }
 
   /**
@@ -293,19 +362,23 @@ export class TaskLedger {
   }
 
   /**
-   * Record a new task in `submitted`.
+   * Record a new task.
    *
-   * The row is written before any delivery so a delivery failure leaves a
-   * durable trace instead of a silent loss.
+   * A task with unsettled dependencies is created as `queued` (待投递) and
+   * left undelivered — the event-driven scheduler dispatches it once every
+   * predecessor settles. A task whose dependencies are already settled is
+   * created `submitted` (the caller delivers it immediately). The row is
+   * written before any delivery so a delivery failure leaves a durable trace
+   * instead of a silent loss.
    *
-   * @param task - the dispatch intent.
+   * @param task - the create intent.
    * @param maxPending - ceiling on unfinished rows for this recipient.
    * @returns the created row, or a refusal when the recipient's queue is full.
    */
   async record(task: NewTask, maxPending: number): Promise<LedgerResult> {
     return this.enqueue(async () => {
       const all = this.listAll()
-      const violation = validateDependencies(task.id, task.dependencies, all, task.workspacePath)
+      const violation = validateDependencies(task.id, task.dependencies, all, task.workspacePath, task.flowId)
       if (violation !== null) {
         return { ok: false as const, message: violation }
       }
@@ -317,13 +390,16 @@ export class TaskLedger {
         }
       }
       const now = new Date().toISOString()
+      const blocked = (task.dependencies ?? []).length > 0
+        ? blockedByOf({ dependencies: task.dependencies } as TaskRecord, all).length > 0
+        : false
       const record: StoredTaskRecord = {
         id: task.id,
         assignedBy: task.assignedBy,
         assignedTo: task.assignedTo,
         workspacePath: task.workspacePath,
         content: task.content,
-        status: 'submitted',
+        status: blocked ? 'queued' : 'submitted',
         mode: task.mode,
         ...(task.messageId !== undefined ? { messageId: task.messageId } : {}),
         retries: task.retries,
@@ -332,10 +408,13 @@ export class TaskLedger {
         ...(task.assignedReviewer !== undefined ? { assignedReviewer: task.assignedReviewer } : {}),
         ...(task.tokensAtStart !== undefined ? { tokensAtStart: task.tokensAtStart } : {}),
         ...(task.dependencies !== undefined ? { dependencies: [...task.dependencies] } : {}),
+        ...(task.acceptanceCriteria !== undefined ? { acceptanceCriteria: task.acceptanceCriteria } : {}),
+        ...(task.flowId !== undefined ? { flowId: task.flowId } : {}),
       }
       await this.table.put(record.id, record)
       const state = this.global.get()
       await this.global.set({ ...state, taskIds: [...state.taskIds, record.id] })
+      this.emitChange(record.id, '-', record.status)
       return { ok: true as const, task: record }
     })
   }
@@ -359,11 +438,15 @@ export class TaskLedger {
     patch: Partial<Omit<StoredTaskRecord, 'id' | 'status'>> = {},
   ): Promise<LedgerResult> {
     return this.enqueue(async () => {
+      const from = this.table.get(id)?.status ?? '-'
       const result = await this.applyTransitionLocked(id, to, patch)
-      if (result.ok && (to === 'failed' || to === 'canceled')) {
-        const reason = result.task.reason ?? to
-        await this.propagateFailureLocked(result.task.id, `dependency-${to === 'canceled' ? 'canceled' : 'failed'}`)
-        void reason
+      if (result.ok) {
+        this.emitChange(id, from, to)
+        if (to === 'failed' || to === 'canceled') {
+          const reason = result.task.reason ?? to
+          await this.propagateFailureLocked(result.task.id, `dependency-${to === 'canceled' ? 'canceled' : 'failed'}`)
+          void reason
+        }
       }
       return result
     })
@@ -418,16 +501,20 @@ export class TaskLedger {
           && target.status !== 'failed' && target.status !== 'canceled'
       })
       if (anyActive) continue
+      const from = row.status
       const result = await this.applyTransitionLocked(row.id, 'failed', { reason })
-      if (result.ok) await this.propagateFailureLocked(row.id, reason)
+      if (result.ok) {
+        this.emitChange(row.id, from, 'failed')
+        await this.propagateFailureLocked(row.id, reason)
+      }
     }
   }
 
   /**
    * List the downstream tasks that became dispatchable after one task
-   * settled: submitted, never delivered, dependent on `id`, and with every
-   * dependency settled. The scheduler delivers each returned id exactly once
-   * (the id vanishes from this list once a messageId is recorded).
+   * settled: `queued`, dependent on `id`, and with every dependency settled.
+   * The scheduler delivers each returned id exactly once (the id vanishes
+   * from this list once it transitions to submitted).
    *
    * @param id - the just-settled task.
    * @returns the ready dependents, in creation order.
@@ -437,8 +524,7 @@ export class TaskLedger {
       const all = this.listAll()
       const ready: TaskId[] = []
       for (const row of all) {
-        if (row.status !== 'submitted') continue
-        if (row.messageId !== undefined) continue
+        if (row.status !== 'queued') continue
         if (!(row.dependencies ?? []).includes(id)) continue
         if (blockedByOf(row, all).length > 0) continue
         ready.push(row.id)
@@ -479,32 +565,46 @@ export class TaskLedger {
    * Edit an undispatched task's requirement text and/or DAG predecessors.
    *
    * The topology is program-driven: an agent that finds its DAG unreasonable
-   * rewrites it here. Only tasks that were never delivered (`submitted`
-   * without a messageId) are editable — a delivered task's changes would
-   * never reach the worker. Dependency changes run the same validation as
-   * creation.
+   * rewrites it here. Only tasks that were never delivered (`queued` — and,
+   * for pre-v7 rows, `submitted` without a messageId) are editable — a
+   * delivered task's changes would never reach the worker. Dependency changes
+   * run the same validation as creation.
    *
    * @param id - the row to edit.
-   * @param patch - `content` and/or `dependencies`; absent fields stay put.
+   * @param patch - `content`, `dependencies`, and/or `acceptanceCriteria`;
+   *   absent fields stay put.
    * @returns the updated row, or a refusal.
    */
   async editTask(
     id: TaskId,
-    patch: { readonly content?: string; readonly dependencies?: readonly TaskId[] },
+    patch: {
+      readonly content?: string
+      readonly dependencies?: readonly TaskId[]
+      readonly acceptanceCriteria?: string
+      readonly flowId?: string
+    },
   ): Promise<LedgerResult> {
     return this.enqueue(async () => {
       const current = this.table.get(id)
       if (current === undefined) {
         return { ok: false as const, message: `no such task "${id}"` }
       }
-      if (current.status !== 'submitted' || current.messageId !== undefined) {
+      const editable = current.status === 'queued'
+        || (current.status === 'submitted' && current.messageId === undefined)
+      if (!editable) {
         return {
           ok: false as const,
           message: `task "${id}" is ${current.status}${current.messageId !== undefined ? ' and already delivered' : ''}; only an undispatched task can be edited`,
         }
       }
-      if (patch.dependencies !== undefined) {
-        const violation = validateDependencies(id, patch.dependencies, this.listAll(), current.workspacePath)
+      // Revalidate whenever the edge set OR the flow could change: a flow
+      // move must carry its dependencies' membership along, so the current
+      // dependency list is checked against the new flow too.
+      if (patch.dependencies !== undefined || patch.flowId !== undefined) {
+        const violation = validateDependencies(
+          id, patch.dependencies ?? current.dependencies, this.listAll(), current.workspacePath,
+          patch.flowId ?? current.flowId,
+        )
         if (violation !== null) {
           return { ok: false as const, message: violation }
         }
@@ -513,11 +613,59 @@ export class TaskLedger {
         ...current,
         ...(patch.content !== undefined ? { content: patch.content } : {}),
         ...(patch.dependencies !== undefined ? { dependencies: [...patch.dependencies] } : {}),
+        ...(patch.acceptanceCriteria !== undefined
+          ? { acceptanceCriteria: patch.acceptanceCriteria }
+          : {}),
+        ...(patch.flowId !== undefined ? { flowId: patch.flowId } : {}),
         updatedAt: new Date().toISOString(),
       }
       await this.table.put(id, updated)
+      this.emitChange(id, 'edited', 'edited')
       return { ok: true as const, task: updated }
     })
+  }
+
+  /**
+   * Create one flow: a named DAG container for tasks.
+   *
+   * @param id - flow identity (uuid).
+   * @param name - display name, 1–80 characters.
+   * @param description - optional note.
+   * @param createdBy - the creating session.
+   * @param workspacePath - the workspace the flow lives in.
+   * @returns the created flow.
+   */
+  async createFlow(
+    id: string,
+    name: string,
+    description: string | undefined,
+    createdBy: SessionId,
+    workspacePath: string,
+  ): Promise<FlowRecord> {
+    return this.enqueue(async () => {
+      const record: StoredFlowRecord = {
+        id,
+        name,
+        ...(description !== undefined && description !== ''
+          ? { description }
+          : {}),
+        createdBy,
+        workspacePath,
+        createdAt: new Date().toISOString(),
+      }
+      await this.flows.put(id, record)
+      return record
+    })
+  }
+
+  /** List every flow in creation order. */
+  listFlows(): FlowRecord[] {
+    return [...this.flows.entries()].map(([, flow]) => flow)
+  }
+
+  /** Read one flow. */
+  getFlow(id: string): FlowRecord | undefined {
+    return this.flows.get(id)
   }
 
   /**
@@ -586,6 +734,7 @@ export class TaskLedger {
           ...(feedback !== undefined ? { feedback } : {}),
         }
         await this.table.put(id, updated)
+        this.emitChange(id, 'completed', 'settled-success')
         return { ok: true as const, task: updated }
       }
       const updated: StoredTaskRecord = {
@@ -599,6 +748,7 @@ export class TaskLedger {
         ...(feedback !== undefined ? { feedback } : {}),
       }
       await this.table.put(id, updated)
+      this.emitChange(id, 'completed', 'settled-failure')
       return { ok: true as const, task: updated }
     })
   }

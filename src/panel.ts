@@ -16,7 +16,6 @@
  * @module dsh-agent-bus/panel
  */
 
-import { stat } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
@@ -102,6 +101,10 @@ export interface TaskView {
   readonly archived: boolean
   /** DAG predecessors (task ids), in declaration order; empty when none. */
   readonly dependencies: readonly string[]
+  /** The dispatcher's minimum acceptance requirement (v1.4); null when unset. */
+  readonly acceptanceCriteria: string | null
+  /** Owning flow id (v1.4); null when the task belongs to no flow. */
+  readonly flowId: string | null
   /** Tasks that depend on this one (reverse edges for the DAG view). */
   readonly dependents: readonly string[]
   /** Unsettled dependencies; empty means the task is ready to dispatch. */
@@ -122,6 +125,7 @@ export const ARCHIVE_AGE_MS = 24 * 60 * 60 * 1000
 
 /** Status counters, mirroring the client panel-model keys. */
 export interface PanelStats {
+  readonly queued: number
   readonly submitted: number
   readonly working: number
   readonly 'input-required': number
@@ -131,9 +135,23 @@ export interface PanelStats {
   readonly total: number
 }
 
+/** One flow in the snapshot directory (v1.4): a named DAG container. */
+export interface FlowView {
+  readonly id: string
+  readonly name: string
+  readonly description: string | null
+  readonly taskCount: number
+  /** Tasks still in the active set (not archived). */
+  readonly unsettledCount: number
+  /** Derived: every task in the flow has archived. */
+  readonly archived: boolean
+}
+
 /** The full document served by GET /plugins/dsh-agent-bus/state. */
 export interface PanelSnapshot {
   readonly workspaces: readonly WorkspaceView[]
+  /** Flow directory for the DAG view; archived flows follow the derived rule. */
+  readonly flows: readonly FlowView[]
   readonly sessions: readonly SessionView[]
   readonly tasks: readonly TaskView[]
   readonly stats: PanelStats
@@ -155,7 +173,7 @@ type MutableStats = { -readonly [K in keyof PanelStats]: number }
 /** Empty stats row. */
 function emptyStats(): MutableStats {
   return {
-    submitted: 0, working: 0, 'input-required': 0,
+    queued: 0, submitted: 0, working: 0, 'input-required': 0,
     completed: 0, failed: 0, canceled: 0, total: 0,
   }
 }
@@ -336,6 +354,8 @@ export async function buildTaskView(
     status: task.status,
     settled: isSettled(task),
     dependencies: [...(task.dependencies ?? [])],
+    acceptanceCriteria: task.acceptanceCriteria ?? null,
+    flowId: task.flowId ?? null,
     content: task.content,
     contentPreview: truncateCodePoints(task.content, 120),
     mode: task.mode,
@@ -368,67 +388,15 @@ export async function buildTaskView(
 }
 
 /**
- * A log file at or below this size holds metadata events only (a seed that
- * ended without a turn); such blank sessions are excluded from the session
- * directory just like the harness sidebar hides them.
- */
-const BLANK_LOG_BYTES = 8 * 1024
-
-/** Cached per-session log probe: the stat calls are disk I/O, throttled. */
-const logProbeCache = new Map<string, { at: number; ok: boolean }>()
-const LOG_PROBE_TTL_MS = 30_000
-
-/**
- * Whether a session's log exists on disk with more than metadata (a
- * substantial, real session). Blank seeds and vanished files return false.
- * Cached per session id so the 2s poll does not stat every log each tick.
+ * The session directory: every session the workspace registry indexes — the
+ * harness sidebar's own index, byte for byte. The plugin adds no session
+ * logic of its own: no log probes, no mtime windows, no attach heuristics.
+ * Sessions referenced by tasks but missing from the registry are added by
+ * the caller as offline references.
  *
- * The persistence store locates logs from the FULL session header (its
- * `locate` builds the path from `meta.cwd`), so a header is required — the
- * workspace registry indexes ids only.
- *
- * @param ctx - plugin context; the persistence store is optional.
- * @param sessionId - the session to probe.
- * @param header - the session header carrying `cwd`; `undefined` when the
- *   persistence store does not know the session (degraded: kept visible).
- * @param now - probe clock.
- */
-async function hasSubstantialLog(
-  ctx: Context,
-  sessionId: string,
-  now: number,
-  header: { id: string; cwd?: string } | undefined,
-): Promise<boolean> {
-  const cached = logProbeCache.get(sessionId)
-  if (cached !== undefined && now - cached.at < LOG_PROBE_TTL_MS) return cached.ok
-  const persistence = ctx.get('sessionPersistence') as
-    | { locate(meta: { id: string; cwd?: string }): { path: string } | undefined }
-    | undefined
-  // No persistence store or unknown session (degraded profile): cannot
-  // probe, keep the session.
-  if (persistence === undefined || header === undefined) return true
-  let ok = false
-  try {
-    const location = persistence.locate(header)
-    if (location !== undefined) {
-      const info = await stat(location.path)
-      ok = info.size > BLANK_LOG_BYTES
-    }
-  } catch {
-    ok = false
-  }
-  logProbeCache.set(sessionId, { at: now, ok })
-  return ok
-}
-
-/**
- * The session directory: every session the workspace registry indexes (the
- * harness sidebar's own index), minus blank seeds, plus any session a task
- * references (added by the caller) and any attached non-subagent session.
- *
- * The registry account is authoritative — no recency window, no attach
- * guesswork: PM and 数学爱好者 stay visible however long they have been
- * idle. Archived sessions are included and flagged; the UI's archive tab
+ * Archived sessions keep their registry slot (archiving never touches
+ * workspace accounting), so they stay in the directory flagged archived; the
+ * UI's archive tab
  * renders them in its offline module. Blank seeds (a log file of metadata
  * only) are excluded exactly like the harness sidebar hides them.
  *
@@ -436,42 +404,19 @@ async function hasSubstantialLog(
  * @param now - probe clock.
  * @returns the authoritative set of visible session ids.
  */
-async function visibleSessionIds(ctx: Context, now: number): Promise<Set<string>> {
+async function visibleSessionIds(ctx: Context): Promise<Set<string>> {
+  // The workspace registry is the ONLY authority, byte for byte the harness
+  // sidebar's source: `sessionIds` is already filtered by the registry's
+  // header index, so whatever the sidebar shows is exactly this set. No log
+  // probes, no mtime windows, no store heuristics — the plugin adds no
+  // session logic of its own. Archived sessions keep their slot (archiving
+  // never touches workspace accounting), so they stay in this set and the
+  // archived flag comes from the archive set.
   const ids = new Set<string>()
-  // Full headers come from the persistence store; the registry indexes ids
-  // only, and the log probe needs cwd to locate the log file.
-  const persistence = ctx.get('sessionPersistence') as
-    | { list(): Promise<{ id: string; cwd?: string }[]> }
-    | undefined
-  const headers = new Map<string, { id: string; cwd?: string }>()
-  if (persistence !== undefined) {
-    try {
-      for (const meta of await persistence.list()) {
-        headers.set(String(meta.id), meta)
-      }
-    } catch {
-      // Degrade to the store set; the directory is a display concern.
-    }
-  }
   const registry = ctx.get('workspaceRegistry') as WorkspaceRegistry | undefined
   for (const workspace of registry?.list() ?? []) {
     for (const sessionId of workspace.sessionIds) {
-      const id = String(sessionId)
-      if (await hasSubstantialLog(ctx, id, now, headers.get(id))) ids.add(id)
-    }
-  }
-  const sessionStore = ctx.get('sessions') as
-    | { list(): { id: string; header: { origin?: string; cwd?: string }; events: readonly { type: string }[] }[] }
-    | undefined
-  if (sessionStore !== undefined) {
-    for (const session of sessionStore.list()) {
-      if (session.header.origin === 'subagent') continue
-      const hasTurn = session.events.some(
-        event => event.type === 'user/message' || event.type === 'assistant/message',
-      )
-      if (!hasTurn) continue
-      if (!await hasSubstantialLog(ctx, session.id, now, { id: session.id, cwd: session.header.cwd })) continue
-      ids.add(session.id)
+      ids.add(String(sessionId))
     }
   }
   return ids
@@ -525,7 +470,7 @@ export async function buildPanelSnapshot(
       registrySessionWorkspace.set(String(sessionId), String(workspace.id))
     }
   }
-  const visible = await visibleSessionIds(ctx, now)
+  const visible = await visibleSessionIds(ctx)
   const archivedIds = new Set((registry?.archivedSessionIds ?? []).map(String))
   const sessionWorkspace = new Map<string, string>()
   for (const sessionId of visible) {
@@ -555,6 +500,7 @@ export async function buildPanelSnapshot(
     tasks.push(view)
     stats.total += 1
     switch (task.status) {
+      case 'queued':
       case 'submitted':
       case 'working':
       case 'input-required':
@@ -581,6 +527,21 @@ export async function buildPanelSnapshot(
     }
   }
 
+  // Flow directory: derived active/archived per flow. The DAG view selects a
+  // flow and renders only its tasks; flow-less tasks never appear there.
+  const flows: FlowView[] = ledger.listFlows().map(flow => {
+    const tasks = allRows.filter(row => row.flowId === flow.id)
+    const unsettled = tasks.filter(row => isActiveRow(row, now))
+    return {
+      id: flow.id,
+      name: flow.name,
+      description: flow.description ?? null,
+      taskCount: tasks.length,
+      unsettledCount: unsettled.length,
+      archived: unsettled.length === 0,
+    }
+  })
+
   return {
     workspaces: workspaces.map(workspace => ({
       id: String(workspace.id),
@@ -589,6 +550,19 @@ export async function buildPanelSnapshot(
     })),
     sessions,
     tasks,
+    flows,
     stats,
   }
+}
+
+/** Whether one row is still in the active set (archive-rule mirror). */
+function isActiveRow(row: TaskRecord, now: number): boolean {
+  if (row.status === 'failed' || row.status === 'canceled' || row.status === 'rejected') {
+    return false
+  }
+  if (row.status === 'completed') {
+    if (row.outcome === undefined) return true
+    return now - Date.parse(row.updatedAt) < ARCHIVE_AGE_MS
+  }
+  return true
 }

@@ -26,9 +26,14 @@ function notifySession(ctx: Context, sessionId: SessionId, taskId: TaskId, text:
 }
 
 /**
- * Deliver one ready task: build the message, record the delivery with the
- * auto flag, and hand it to the harness inbox. Exported so the edit_task
- * tool can dispatch a task whose dependencies just cleared.
+ * Deliver one queued task: transition it to submitted, record the delivery
+ * with the auto flag, and hand it to the harness inbox. Idempotent by
+ * construction — a task that is not queued (already delivered, running, or
+ * terminal) is skipped, so the client's event-driven POST /dispatch and the
+ * server backstop sweep can race without double-delivery.
+ *
+ * Exported so the edit_task tool can dispatch a task whose dependencies just
+ * cleared.
  *
  * @param ctx - plugin context (notifications).
  * @param ledger - the task ledger.
@@ -37,9 +42,12 @@ function notifySession(ctx: Context, sessionId: SessionId, taskId: TaskId, text:
 export async function dispatchOne(ctx: Context, ledger: TaskLedger, id: TaskId): Promise<void> {
   const task = ledger.get(id)
   if (task === undefined || task.assignedTo === undefined) return
+  if (task.status !== 'queued') return // idempotent: nothing to deliver
   const worker = ctx.agents.get(task.assignedTo)
-  if (worker === undefined) return // offline worker: the row stays undelivered and the sweep retries
+  if (worker === undefined) return // offline worker: the row stays queued and the sweep retries
   const message = buildTaskMessage(task.assignedBy, task.id, task.content, 'scheduler')
+  const advanced = await ledger.transition(id, 'submitted')
+  if (!advanced.ok) return // raced: another dispatcher already moved it
   await ledger.recordDelivery(task.id, message.id, true)
   deliverTask(worker, message, task.mode)
   notifySession(
@@ -83,9 +91,7 @@ export async function releaseDependents(
 export async function dispatchReadyTasks(ctx: Context, ledger: TaskLedger): Promise<number> {
   const all = ledger.listAll()
   const ready = all.filter(task =>
-    task.status === 'submitted'
-    && task.messageId === undefined
-    && (task.dependencies ?? []).length > 0
+    task.status === 'queued'
     && blockedByOf(task, all).length === 0)
   for (const task of ready) {
     await dispatchOne(ctx, ledger, task.id)
