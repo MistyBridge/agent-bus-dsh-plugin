@@ -157,7 +157,7 @@ interface TaskDetailView {
   readonly to?: string
   readonly content: string
   readonly acceptanceCriteria?: string
-  readonly handoffs?: readonly { fromTask: string; document: string; at: string }[]
+  readonly handoffs?: { fromTask: string; document: string; at: string }[]
   readonly report?: string
   readonly question?: string
   readonly outcome?: string
