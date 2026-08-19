@@ -17,6 +17,9 @@
  * @module dsh-agent-bus/ledger
  */
 
+import { mkdir, readdir, unlink, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import type { Context } from '@deepseek-ai/cordis'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { DomainGlobal, KvTable } from '@deepseek-ai/dsh-storage-domain'
@@ -33,6 +36,7 @@ import {
   type TaskOutcome,
   type TaskRecord,
   type TaskStatus,
+  type TokenBuckets,
 } from './types.ts'
 
 /**
@@ -86,10 +90,128 @@ export interface NewTask {
   readonly workspacePath: string
   readonly content: string
   readonly mode: DeliveryMode
-  /** Harness message identity, recorded before delivery so the claimed listener can find the row. */
-  readonly messageId: string
+  /**
+   * Harness message identity, recorded before delivery so the claimed
+   * listener can find the row. Absent for a blocked DAG task: it is created
+   * but not delivered until its dependencies settle.
+   */
+  readonly messageId?: string
   /** Rework count; starts at 0 for a fresh task. */
   readonly retries: number
+  /**
+   * Dispatch-time token totals per participant session (deduplicated staff).
+   * Optional: an offline session or an absent projection registry simply
+   * leaves its key out, and the panel shows the delta as unavailable.
+   */
+  readonly tokensAtStart?: Record<string, TokenBuckets>
+  /**
+   * DAG predecessors. When non-empty and any predecessor is unsettled, the
+   * task is created WITHOUT delivery; the scheduler dispatches it once every
+   * predecessor settles (see `pendingReleases`).
+   */
+  readonly dependencies?: readonly TaskId[]
+}
+
+/** Maximum number of DAG predecessors one task may declare. */
+export const MAX_DEPENDENCIES = 16
+
+/**
+ * Whether one row has settled successfully (its DAG precondition).
+ *
+ * @param row - the row.
+ * @returns `true` when the row is settled and the verdict was success.
+ */
+export function isSettledSuccess(row: TaskRecord): boolean {
+  return row.status === 'completed' && row.outcome === 'success'
+}
+
+/**
+ * A task's unsatisfied DAG predecessors: dependencies that have not settled
+ * successfully. An empty list means the task is ready to dispatch.
+ *
+ * @param row - the row.
+ * @param all - every row (dependency lookup).
+ * @returns the ids of still-unsettled dependencies, in declaration order.
+ */
+export function blockedByOf(row: TaskRecord, all: readonly TaskRecord[]): readonly TaskId[] {
+  if (row.dependencies === undefined || row.dependencies.length === 0) return []
+  const byId = new Map(all.map(item => [String(item.id), item]))
+  return row.dependencies.filter(dep => !isSettledSuccess(byId.get(String(dep)) as TaskRecord))
+}
+
+/**
+ * Validate a proposed dependency list against the ledger's DAG invariants.
+ *
+ * @param taskId - the task declaring the dependencies (self-reference check).
+ * @param dependencies - the proposed predecessor list.
+ * @param all - every row (existence, workspace, and cycle checks).
+ * @param workspacePath - the declaring task's workspace.
+ * @returns an error message, or `null` when the list is acceptable.
+ */
+export function validateDependencies(
+  taskId: TaskId,
+  dependencies: readonly TaskId[] | undefined,
+  all: readonly TaskRecord[],
+  workspacePath: string,
+): string | null {
+  if (dependencies === undefined || dependencies.length === 0) return null
+  if (dependencies.length > MAX_DEPENDENCIES) {
+    return `task "${taskId}" declares ${dependencies.length} dependencies, at the ${MAX_DEPENDENCIES} limit`
+  }
+  const ids = new Set(dependencies.map(String))
+  if (ids.has(String(taskId))) {
+    return `task "${taskId}" cannot depend on itself`
+  }
+  if (ids.size !== dependencies.length) {
+    return `task "${taskId}" declares duplicate dependencies`
+  }
+  const byId = new Map(all.map(item => [String(item.id), item]))
+  for (const dep of ids) {
+    const row = byId.get(dep)
+    if (row === undefined) {
+      return `task "${taskId}" depends on unknown task "${dep}"`
+    }
+    if (row.workspacePath !== workspacePath) {
+      return `task "${taskId}" depends on "${dep}" from another workspace`
+    }
+  }
+  // Cycle check: the candidate edge set is the current table plus this
+  // declaration. A cycle anywhere in the graph rejects the whole change.
+  const edges = new Map<string, string[]>()
+  for (const row of all) {
+    const deps = row.dependencies ?? []
+    if (deps.length > 0) edges.set(String(row.id), deps.map(String))
+  }
+  edges.set(String(taskId), [...ids])
+  if (detectCycle(edges)) {
+    return `task "${taskId}" would create a dependency cycle`
+  }
+  return null
+}
+
+/**
+ * Depth-first cycle detection over a directed edge map.
+ *
+ * @param edges - node id → outgoing dependency ids.
+ * @returns `true` when the graph contains any cycle.
+ */
+export function detectCycle(edges: ReadonlyMap<string, readonly string[]>): boolean {
+  const state = new Map<string, 0 | 1 | 2>() // 0 = unvisited, 1 = in-stack, 2 = done
+  const visit = (node: string): boolean => {
+    const mark = state.get(node) ?? 0
+    if (mark === 1) return true
+    if (mark === 2) return false
+    state.set(node, 1)
+    for (const next of edges.get(node) ?? []) {
+      if (visit(next)) return true
+    }
+    state.set(node, 2)
+    return false
+  }
+  for (const node of edges.keys()) {
+    if (visit(node)) return true
+  }
+  return false
 }
 
 /** Result of a ledger mutation. */
@@ -123,7 +245,44 @@ export class TaskLedger {
     ledger.table = domain.table('tasks')
     ledger.peers = domain.table('peers')
     ledger.global = domain.global
+    await ledger.snapshotBackup()
     return ledger
+  }
+
+  /**
+   * Write a full content snapshot to the backups dir, kept to the newest 20.
+   *
+   * Insurance, not runtime data: the ledger itself never deletes rows, but a
+   * domain version bump recreates the medium wholesale (see v1.2 spec §2.1 —
+   * that is how task e420b249 and the v5-era rows were lost). Every open
+   * writes one snapshot so a later loss is at least recoverable from the last
+   * boot that saw the rows. Best-effort: a failed snapshot logs and does not
+   * fail boot.
+   */
+  private async snapshotBackup(): Promise<void> {
+    // vitest sets NODE_ENV=test; unit tests open the ledger over in-memory
+    // domains and must not scribble on the real backup dir (or prune real
+    // snapshots).
+    if (process.env.NODE_ENV === 'test') return
+    const dir = dshHomePath('agent-bus', 'backups')
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const rows = this.listAll()
+    const snapshot = {
+      at: new Date().toISOString(),
+      taskIds: this.global.get().taskIds,
+      tasks: rows,
+      peers: Array.from(this.peers.keys(), key => ({ key, card: this.peers.get(key) })),
+    }
+    try {
+      await mkdir(dir, { recursive: true })
+      await writeFile(join(dir, `ledger-${stamp}.json`), JSON.stringify(snapshot, null, 1), 'utf8')
+      const files = (await readdir(dir)).filter(name => name.startsWith('ledger-')).sort()
+      const stale = files.slice(0, Math.max(0, files.length - 20))
+      await Promise.all(stale.map(name => unlink(join(dir, name))))
+    } catch (error: unknown) {
+      // eslint-disable-next-line no-console
+      console.error(`agent-bus: ledger snapshot backup failed: ${String(error)}`)
+    }
   }
 
   /** Serialize one mutation behind every earlier one. */
@@ -145,7 +304,12 @@ export class TaskLedger {
    */
   async record(task: NewTask, maxPending: number): Promise<LedgerResult> {
     return this.enqueue(async () => {
-      const pending = this.listFor(task.assignedTo).filter(row => UNFINISHED.includes(row.status))
+      const all = this.listAll()
+      const violation = validateDependencies(task.id, task.dependencies, all, task.workspacePath)
+      if (violation !== null) {
+        return { ok: false as const, message: violation }
+      }
+      const pending = all.filter(row => row.assignedTo === task.assignedTo && UNFINISHED.includes(row.status))
       if (pending.length >= maxPending) {
         return {
           ok: false as const,
@@ -161,11 +325,13 @@ export class TaskLedger {
         content: task.content,
         status: 'submitted',
         mode: task.mode,
-        messageId: task.messageId,
+        ...(task.messageId !== undefined ? { messageId: task.messageId } : {}),
         retries: task.retries,
         createdAt: now,
         updatedAt: now,
         ...(task.assignedReviewer !== undefined ? { assignedReviewer: task.assignedReviewer } : {}),
+        ...(task.tokensAtStart !== undefined ? { tokensAtStart: task.tokensAtStart } : {}),
+        ...(task.dependencies !== undefined ? { dependencies: [...task.dependencies] } : {}),
       }
       await this.table.put(record.id, record)
       const state = this.global.get()
@@ -176,6 +342,11 @@ export class TaskLedger {
 
   /**
    * Apply one status transition, rejecting a move the machine forbids.
+   *
+   * A transition INTO a terminal failure (`failed` / `canceled`) additionally
+   * runs DAG failure propagation: every downstream task whose unsettled
+   * dependencies are now all terminally failed is failed in turn,
+   * recursively — the whole flow is driven by code, no human step.
    *
    * @param id - the row to advance.
    * @param to - the target status.
@@ -188,25 +359,91 @@ export class TaskLedger {
     patch: Partial<Omit<StoredTaskRecord, 'id' | 'status'>> = {},
   ): Promise<LedgerResult> {
     return this.enqueue(async () => {
-      const current = this.table.get(id)
-      if (current === undefined) {
-        return { ok: false as const, message: `no such task "${id}"` }
+      const result = await this.applyTransitionLocked(id, to, patch)
+      if (result.ok && (to === 'failed' || to === 'canceled')) {
+        const reason = result.task.reason ?? to
+        await this.propagateFailureLocked(result.task.id, `dependency-${to === 'canceled' ? 'canceled' : 'failed'}`)
+        void reason
       }
-      if (!canTransition(current.status, to)) {
-        return {
-          ok: false as const,
-          message: `task "${id}" is ${current.status}; it cannot become ${to}`,
-        }
+      return result
+    })
+  }
+
+  /** Transition core, run inside the write chain (no re-enqueue). */
+  private async applyTransitionLocked(
+    id: TaskId,
+    to: TaskStatus,
+    patch: Partial<Omit<StoredTaskRecord, 'id' | 'status'>> = {},
+  ): Promise<LedgerResult> {
+    const current = this.table.get(id)
+    if (current === undefined) {
+      return { ok: false as const, message: `no such task "${id}"` }
+    }
+    if (!canTransition(current.status, to)) {
+      return {
+        ok: false as const,
+        message: `task "${id}" is ${current.status}; it cannot become ${to}`,
       }
-      const updated: StoredTaskRecord = {
-        ...current,
-        ...patch,
-        id: current.id,
-        status: to,
-        updatedAt: new Date().toISOString(),
+    }
+    const updated: StoredTaskRecord = {
+      ...current,
+      ...patch,
+      id: current.id,
+      status: to,
+      updatedAt: new Date().toISOString(),
+    }
+    await this.table.put(id, updated)
+    return { ok: true as const, task: updated }
+  }
+
+  /**
+   * DAG failure propagation: after `failedId` reached a terminal failure,
+   * fail every downstream task whose unsettled dependencies are all
+   * terminally failed, recursively. A downstream with any still-active
+   * dependency waits for it instead.
+   *
+   * @param failedId - the terminal-failed task whose dependents are examined.
+   * @param reason - the failure reason stamped on propagated rows
+   *   (`dependency-failed` / `dependency-canceled`).
+   */
+  private async propagateFailureLocked(failedId: TaskId, reason: string): Promise<void> {
+    for (const row of this.listAll()) {
+      const deps = row.dependencies ?? []
+      if (!deps.includes(failedId)) continue
+      if (isSettledSuccess(row) || row.status === 'failed' || row.status === 'canceled') continue
+      const blocked = blockedByOf(row, this.listAll())
+      const anyActive = blocked.some(dep => {
+        const target = this.table.get(dep)
+        return target !== undefined && !isSettledSuccess(target)
+          && target.status !== 'failed' && target.status !== 'canceled'
+      })
+      if (anyActive) continue
+      const result = await this.applyTransitionLocked(row.id, 'failed', { reason })
+      if (result.ok) await this.propagateFailureLocked(row.id, reason)
+    }
+  }
+
+  /**
+   * List the downstream tasks that became dispatchable after one task
+   * settled: submitted, never delivered, dependent on `id`, and with every
+   * dependency settled. The scheduler delivers each returned id exactly once
+   * (the id vanishes from this list once a messageId is recorded).
+   *
+   * @param id - the just-settled task.
+   * @returns the ready dependents, in creation order.
+   */
+  async pendingReleases(id: TaskId): Promise<TaskId[]> {
+    return this.enqueue(async () => {
+      const all = this.listAll()
+      const ready: TaskId[] = []
+      for (const row of all) {
+        if (row.status !== 'submitted') continue
+        if (row.messageId !== undefined) continue
+        if (!(row.dependencies ?? []).includes(id)) continue
+        if (blockedByOf(row, all).length > 0) continue
+        ready.push(row.id)
       }
-      await this.table.put(id, updated)
-      return { ok: true as const, task: updated }
+      return ready
     })
   }
 
@@ -218,9 +455,10 @@ export class TaskLedger {
    *
    * @param id - the row to update.
    * @param messageId - the harness identity of the delivered answer.
+   * @param auto - set when the scheduler (not a tool call) delivered this task.
    * @returns the updated row, or a refusal.
    */
-  async recordDelivery(id: TaskId, messageId: string): Promise<LedgerResult> {
+  async recordDelivery(id: TaskId, messageId: string, auto?: boolean): Promise<LedgerResult> {
     return this.enqueue(async () => {
       const current = this.table.get(id)
       if (current === undefined) {
@@ -229,6 +467,52 @@ export class TaskLedger {
       const updated: StoredTaskRecord = {
         ...current,
         messageId,
+        ...(auto === true ? { auto: true } : {}),
+        updatedAt: new Date().toISOString(),
+      }
+      await this.table.put(id, updated)
+      return { ok: true as const, task: updated }
+    })
+  }
+
+  /**
+   * Edit an undispatched task's requirement text and/or DAG predecessors.
+   *
+   * The topology is program-driven: an agent that finds its DAG unreasonable
+   * rewrites it here. Only tasks that were never delivered (`submitted`
+   * without a messageId) are editable — a delivered task's changes would
+   * never reach the worker. Dependency changes run the same validation as
+   * creation.
+   *
+   * @param id - the row to edit.
+   * @param patch - `content` and/or `dependencies`; absent fields stay put.
+   * @returns the updated row, or a refusal.
+   */
+  async editTask(
+    id: TaskId,
+    patch: { readonly content?: string; readonly dependencies?: readonly TaskId[] },
+  ): Promise<LedgerResult> {
+    return this.enqueue(async () => {
+      const current = this.table.get(id)
+      if (current === undefined) {
+        return { ok: false as const, message: `no such task "${id}"` }
+      }
+      if (current.status !== 'submitted' || current.messageId !== undefined) {
+        return {
+          ok: false as const,
+          message: `task "${id}" is ${current.status}${current.messageId !== undefined ? ' and already delivered' : ''}; only an undispatched task can be edited`,
+        }
+      }
+      if (patch.dependencies !== undefined) {
+        const violation = validateDependencies(id, patch.dependencies, this.listAll(), current.workspacePath)
+        if (violation !== null) {
+          return { ok: false as const, message: violation }
+        }
+      }
+      const updated: StoredTaskRecord = {
+        ...current,
+        ...(patch.content !== undefined ? { content: patch.content } : {}),
+        ...(patch.dependencies !== undefined ? { dependencies: [...patch.dependencies] } : {}),
         updatedAt: new Date().toISOString(),
       }
       await this.table.put(id, updated)

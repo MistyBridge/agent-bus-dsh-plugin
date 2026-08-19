@@ -12,6 +12,17 @@
 
 import type { SessionId } from '@deepseek-ai/dsh-session'
 
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /**
+     * A task settled successfully; the DAG scheduler releases its dependents.
+     * @param taskId - the settled task's id.
+     * @mode emit
+     */
+    'agent-bus/settle'(taskId: string): void
+  }
+}
+
 /**
  * Ledger-owned task identity. Independent of the harness `MessageId` because
  * a task exists in `submitted` before any delivery has produced one.
@@ -58,6 +69,18 @@ export type TaskOutcome = 'success' | 'failure'
  * for another message to wake the recipient, so it never carries work.
  */
 export type DeliveryMode = 'followup' | 'steer'
+
+/**
+ * Four-bucket token usage, the same shape as the token-meter projection
+ * (`uncachedInputTokens` / `outputTokens` / `cacheReadTokens` /
+ * `cacheWriteTokens`). Used for task-period consumption deltas.
+ */
+export interface TokenBuckets {
+  readonly uncachedInputTokens: number
+  readonly outputTokens: number
+  readonly cacheReadTokens: number
+  readonly cacheWriteTokens: number
+}
 
 /** One machine-readable capability a peer advertises. */
 export interface Capability {
@@ -118,6 +141,20 @@ export interface TaskRecord {
   readonly reason?: string
   /** Rework count: how many times this task has been sent back to the worker. */
   readonly retries: number
+  /**
+   * Dispatch-time token totals per participant session (deduplicated staff),
+   * taken when the task was recorded. Task-period consumption is the current
+   * projection minus this snapshot; absent sessions were offline at dispatch.
+   */
+  readonly tokensAtStart?: Record<string, TokenBuckets>
+  /**
+   * DAG predecessors: task ids that must settle (outcome success) before this
+   * task may be dispatched. Written at creation, editable via edit_task while
+   * the task is undispatched; the ledger rejects cycles and self-references.
+   */
+  readonly dependencies?: readonly TaskId[]
+  /** Set when the scheduler auto-dispatched this task after its dependencies cleared. */
+  readonly auto?: boolean
   /** ISO-8601 creation stamp. */
   readonly createdAt: string
   /** ISO-8601 stamp of the last status change. */

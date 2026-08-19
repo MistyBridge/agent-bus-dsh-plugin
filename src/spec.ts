@@ -23,6 +23,18 @@ const taskId = z.string().transform(value => value as TaskId)
 /** Session id schema at the durable boundary. */
 const sessionId = z.string().transform(SessionId)
 
+/**
+ * Four-bucket token usage at the durable boundary, mirroring the token-meter
+ * projection shape. Non-negative integers; strict so an unexpected bucket
+ * fails load rather than parsing silently.
+ */
+export const tokenBuckets = z.object({
+  uncachedInputTokens: z.number().int().nonnegative(),
+  outputTokens: z.number().int().nonnegative(),
+  cacheReadTokens: z.number().int().nonnegative(),
+  cacheWriteTokens: z.number().int().nonnegative(),
+}).strict()
+
 /** Capability id: kebab-case machine key, matched by programs and future routing. */
 const capabilityId = z.string().regex(/^[a-z][a-z0-9-]{0,31}$/)
 
@@ -63,6 +75,9 @@ export const taskRecord = z.object({
   feedback: z.string().optional(),
   reason: z.string().optional(),
   retries: z.number().int().nonnegative(),
+  tokensAtStart: z.record(sessionId, tokenBuckets).optional(),
+  dependencies: z.array(taskId).max(16).optional(),
+  auto: z.boolean().optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
 })
@@ -98,14 +113,16 @@ export type AgentBusDomainState = z.infer<typeof agentBusDomainState>
 
 /**
  * The agent-bus domain spec: a `tasks` table keyed by task id, a `peers`
- * table keyed by session id, plus the order singleton. Version 3 broke
- * version 2 deliberately: tasks gained an independent reviewer role and the
- * rework loop (completed -> submitted) replaced the supersedes chain, so the
- * whole lifecycle lives on one task id. No migration for pre-release data.
+ * table keyed by session id, plus the order singleton. Version 6 adds the DAG
+ * fields (`dependencies`, `auto`) for flow orchestration; both are optional,
+ * so rows written by v5 parse unchanged, but the version bump still
+ * invalidates the storage unit — delete `agent_bus.json` once after
+ * upgrading, the same pre-release discipline earlier versions followed. No
+ * migration for pre-release data.
  */
 export const agentBusDomainSpec = defineDomain({
   name: 'agent_bus',
-  version: 4,
+  version: 6,
   global: {
     schema: agentBusDomainState,
     initial: { taskIds: [] },

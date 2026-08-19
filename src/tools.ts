@@ -21,12 +21,16 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { assertNever } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
+import type { Agent } from '@deepseek-ai/dsh-agent'
+import type { Session } from '@deepseek-ai/dsh-session'
 import { authorizePeer, authorizeSettlement, resolveWorkspacePath } from './authorize.ts'
-import { admitContent, buildTaskMessage, deliverTask } from './delivery.ts'
+import { admitContent, buildMessageMessage, buildTaskMessage, deliverTask, type DeliverySource } from './delivery.ts'
 import type { ReportStore } from './external.ts'
-import type { TaskLedger } from './ledger.ts'
+import { blockedByOf, type TaskLedger } from './ledger.ts'
+import { isTokenBuckets, staffRoles } from './panel.ts'
 import { DispatchRateLimiter } from './rate-limit.ts'
-import { TaskId, type DeliveryMode, type TaskRecord } from './types.ts'
+import { dispatchOne } from './scheduler.ts'
+import { TaskId, type DeliveryMode, type TaskRecord, type TokenBuckets } from './types.ts'
 
 /** Resolved plugin configuration the tools read. */
 export interface ToolsConfig {
@@ -35,6 +39,8 @@ export interface ToolsConfig {
   readonly maxSendsPerMinute: number
   /** Reports longer than this are externalized to the report store (default `400`). */
   readonly maxInlineReport: number
+  /** Lightweight messages one sender may send per minute (default `20`). */
+  readonly maxMessagesPerMinute: number
 }
 
 /** Services the tool bodies need beyond `ctx`. */
@@ -42,6 +48,8 @@ export interface ToolsDeps {
   readonly ledger: TaskLedger
   readonly workspaces: WorkspaceRegistry
   readonly limiter: DispatchRateLimiter
+  /** Separate sliding window for send_note, so chatter cannot exhaust task quota. */
+  readonly messageLimiter: DispatchRateLimiter
   readonly reports: ReportStore
 }
 
@@ -55,6 +63,7 @@ interface TaskView {
   readonly report?: string
   readonly outcome?: string
   readonly reason?: string
+  readonly dependencies?: string[]
   readonly retries: number
 }
 
@@ -70,6 +79,7 @@ function view(task: TaskRecord): TaskView {
     ...(task.report !== undefined ? { report: task.report } : {}),
     ...(task.outcome !== undefined ? { outcome: task.outcome } : {}),
     ...(task.reason !== undefined ? { reason: task.reason } : {}),
+    ...(task.dependencies !== undefined ? { dependencies: task.dependencies.map(String) } : {}),
     retries: task.retries,
   }
 }
@@ -84,14 +94,54 @@ function view(task: TaskRecord): TaskView {
  * @param t - the projected row.
  * @returns the text lines for one row.
  */
+/** Settled rows stay in the active listing for this long (mirror of the panel). */
+const ARCHIVE_AGE_MS = 24 * 60 * 60 * 1000
+
+/**
+ * Whether one row is visible to the agent tools — the active set only.
+ *
+ * Archived tasks are invisible to list_tasks by design, using the SAME
+ * archive rule as the panel: a terminal failure/cancel/reject leaves the
+ * listing immediately, and a settled success leaves once the settlement is
+ * more than 24h old (the panel's archive-phase age). Everything the agent
+ * can still act on — submitted, working, awaiting input, and a completed
+ * row awaiting its verdict — stays visible. History lives in the panel and
+ * session logs; get_task still reads an archived row by id for a reference
+ * that reached the agent before archiving.
+ *
+ * @param row - the ledger row.
+ * @param now - current epoch milliseconds.
+ * @returns `true` when the row belongs to the active set.
+ */
+export function isActiveTask(row: TaskRecord, now: number): boolean {
+  if (row.status === 'failed' || row.status === 'canceled' || row.status === 'rejected') {
+    return false
+  }
+  if (row.status === 'completed') {
+    // Awaiting the verdict: still active. Settled: active for the archive
+    // grace period only.
+    if (row.outcome === undefined) return true
+    return now - Date.parse(row.updatedAt) < ARCHIVE_AGE_MS
+  }
+  return true
+}
+
 export function renderTaskRow(t: TaskView): string {
-  const head = `${t.id} [${t.status}] ${t.content.slice(0, 80)}`
+  // A completed row without a verdict reads as 「待验收」 to the model, mirroring
+  // the panel badge — a status the reviewer must settle next.
+  const badge = t.status === 'completed' && t.outcome === undefined
+    ? 'completed 待验收'
+    : t.status
+  const head = `${t.id} [${badge}] ${t.content.slice(0, 80)}`
   const report = t.report !== undefined
     ? `\n  submitted result: ${t.report.slice(0, 400)}`
     : ''
   const verdict = t.outcome !== undefined ? `\n  verdict: ${t.outcome}` : ''
   const reason = t.reason !== undefined ? `\n  reason: ${t.reason}` : ''
-  return head + report + verdict + reason
+  const deps = t.dependencies !== undefined && t.dependencies.length > 0
+    ? `\n  depends on: ${t.dependencies.join(', ')}`
+    : ''
+  return head + report + verdict + reason + deps
 }
 
 /** Model-facing projection of one full task record. */
@@ -208,10 +258,53 @@ function requireCaller(agent: { id: SessionId } | undefined, tool: string): Sess
  * @param taskId - the task the notice concerns.
  * @param text - the notice body.
  */
-export function notifySession(ctx: Context, sessionId: SessionId, taskId: TaskId, text: string): void {
+/**
+ * Snapshot the dispatch-time token totals of a task's participants.
+ *
+ * The panel computes task-period consumption as `current projection − this
+ * snapshot`, so the snapshot is taken once, at dispatch, and never refreshed.
+ * A participant that is offline, or a profile without the projection
+ * registry, simply leaves its key out of the record — the panel then shows
+ * that staff row's delta as unavailable.
+ *
+ * @param ctx - plugin context; services are read via `ctx.get` and may be absent.
+ * @param initiator - the dispatching session.
+ * @param executor - the target session.
+ * @param reviewer - the named reviewer, or `undefined` for the initiator default.
+ * @returns the token snapshot keyed by participant session id, or `undefined`
+ *   when no participant's usage could be read.
+ */
+function snapshotTokensAtDispatch(
+  ctx: Context,
+  initiator: SessionId,
+  executor: SessionId,
+  reviewer: SessionId | undefined,
+): Record<string, TokenBuckets> | undefined {
+  const projections = ctx.get('sessionProjections') as
+    | { snapshot(session: Session): { values: Record<string, unknown> } }
+    | undefined
+  const agents = ctx.get('agents') as { get(id: string): Agent | undefined } | undefined
+  if (projections === undefined || agents === undefined) return undefined
+  const out: Record<string, TokenBuckets> = {}
+  for (const { sessionId } of staffRoles(initiator, executor, reviewer)) {
+    const agent = agents.get(sessionId)
+    if (agent === undefined) continue
+    const value = projections.snapshot(agent.session).values.tokenUsage
+    if (isTokenBuckets(value)) out[sessionId] = value
+  }
+  return Object.keys(out).length === 0 ? undefined : out
+}
+
+export function notifySession(
+  ctx: Context,
+  sessionId: SessionId,
+  taskId: TaskId,
+  text: string,
+  tool: DeliverySource = 'dispatch_task',
+): void {
   const session = ctx.agents.get(sessionId)
   if (session === undefined) return
-  const notice = buildTaskMessage(sessionId, taskId, text)
+  const notice = buildTaskMessage(sessionId, taskId, text, tool)
   deliverTask(session, notice, 'followup')
 }
 
@@ -319,6 +412,63 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
   }))
 
   ctx.tools.register(defineTool({
+    // Named send_note, NOT send_message: the harness bundle reserves
+    // send_message globally for subagent conversation (dsh-tool-subagent-
+    // control), so the peer channel must not collide with it.
+    name: 'send_note',
+    description:
+      'Send a lightweight note to a live peer in your workspace: a message, a question, a '
+      + 'confirmation, a coordination ping — anything that is NOT work the peer must deliver a '
+      + 'verifiable result for. The note lands in the peer\'s inbox like an ordinary message; '
+      + 'there is NO task record, no acceptance, and nothing to report or settle. The peer simply '
+      + 'replies in prose (with send_note back to you, if it replies at all). Use dispatch_task '
+      + 'instead when the peer must produce a result you will verify — a note channel needs no '
+      + 'lifecycle, and a task channel whose work was really a chat is how tasks get stuck forever '
+      + 'in working.',
+    parameters: {
+      target: { type: 'string', required: true, description: 'Session id of the peer, from list_peers.' },
+      content: { type: 'string', required: true, description: 'The note text.' },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          delivered: { type: 'boolean', required: true },
+          messageId: { type: 'string', required: true },
+        },
+      },
+      render: (_args, result) => [{
+        type: 'text',
+        text: result.delivered
+          ? `note delivered (${String(result.messageId).slice(0, 8)}…)`
+          : 'note not delivered',
+      }],
+    },
+    presentCall: (args) => ({ card: 'generic', title: 'agent-bus:发送消息', kind: 'other', rawInput: { target: args.target } }),
+    presentResult: (_args, result) => ({ card: 'generic', title: 'agent-bus:发送消息', rawInput: result }),
+    async execute(args, exec) {
+      const callerId = requireCaller(exec.agent, 'send_note')
+      if (!deps.messageLimiter.admit(callerId, Date.now())) {
+        throw new Error(
+          `message rate exceeded: at most ${config.maxMessagesPerMinute} messages per minute`,
+        )
+      }
+      const targetId = args.target as SessionId
+      const decision = await authorizePeer(ctx, workspaces, callerId, targetId)
+      if (!decision.ok) throw new Error(decision.message)
+      const admitted = admitContent(args.content, config.maxContentLength)
+      if (!admitted.ok) throw new Error(admitted.message)
+      // No ledger write: a note has no row, so the claimed-listener cannot
+      // match it and no lifecycle ever starts. The message id is generated
+      // here and returned so the sender keeps a delivery receipt.
+      const message = buildMessageMessage(callerId, randomUUID(), admitted.content)
+      deliverTask(decision.target, message, 'followup')
+      return { delivered: true, messageId: message.id }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
     name: 'dispatch_task',
     description:
       'Dispatch one task to a live peer in your workspace. The task is recorded in the ledger and '
@@ -347,6 +497,13 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         type: 'string',
         description: 'Answering a request_input: the input-required task id. The message answers its question.',
       },
+      depends_on: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'DAG predecessors: task ids that must settle before this one is dispatched. '
+          + 'When any predecessor is unsettled the task is only created — the scheduler dispatches '
+          + 'it automatically once every dependency settles. Edit it with edit_task before it dispatches.',
+      },
     },
     output: {
       schema: {
@@ -356,12 +513,16 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
           taskId: { type: 'string', required: true },
           status: { type: 'string', required: true },
           queuePosition: { type: 'number', required: true },
+          blockedBy: { type: 'array', items: { type: 'string' }, required: true },
         },
       },
       render: (_args, result) => [{
         type: 'text',
         text: `task ${result.taskId} → ${String(result.status)}, `
-          + `${String(result.queuePosition)} unfinished task(s) in that queue`,
+          + `${String(result.queuePosition)} unfinished task(s) in that queue`
+          + (result.blockedBy.length > 0
+            ? `, awaiting dependencies: ${result.blockedBy.join(', ')}`
+            : ''),
       }],
     },
     presentCall: (args) => ({ card: 'generic', title: 'agent-bus:派发任务', kind: 'other', rawInput: { target: args.target, ...(args.reviewer !== undefined ? { reviewer: args.reviewer } : {}), ...(args.task_id !== undefined ? { task_id: args.task_id } : {}) } }),
@@ -400,7 +561,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         const pending = ledger.listFor(targetId).filter(
           row => row.status === 'submitted' || row.status === 'working' || row.status === 'input-required',
         )
-        return { taskId, status: 'input-required', queuePosition: pending.length }
+        return { taskId: String(taskId), status: 'input-required', queuePosition: pending.length, blockedBy: [] as string[] }
       }
 
       // Dispatch path: a fresh task. Reviewer defaults to the initiator.
@@ -411,7 +572,9 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         if (!reviewerDecision.ok) throw new Error(reviewerDecision.message)
         reviewer = args.reviewer as SessionId
       }
+      const dependencies = (args.depends_on as string[] | undefined)?.map(id => TaskId(id))
       const message = buildTaskMessage(callerId, taskId, admitted.content)
+      const tokensAtStart = snapshotTokensAtDispatch(ctx, callerId, targetId, reviewer)
       const recorded = await ledger.record({
         id: taskId,
         assignedBy: callerId,
@@ -420,26 +583,111 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         workspacePath: decision.workspacePath,
         content: admitted.content,
         mode,
-        messageId: message.id,
         retries: 0,
+        ...(tokensAtStart !== undefined ? { tokensAtStart } : {}),
+        ...(dependencies !== undefined ? { dependencies } : {}),
       }, config.maxPendingPerAgent)
       if (!recorded.ok) throw new Error(recorded.message)
 
-      deliverTask(decision.target, message, mode)
+      // A task with dependencies is created without delivery until every
+      // predecessor settles; the scheduler dispatches it then. A task whose
+      // dependencies are already settled delivers immediately, recording the
+      // message id before the inbox can claim it.
+      const blocked: string[] = dependencies === undefined
+        ? []
+        : [...blockedByOf(recorded.task, ledger.listAll()).map(String)]
+      if (blocked.length === 0) {
+        await ledger.recordDelivery(taskId, message.id)
+        deliverTask(decision.target, message, mode)
+      }
       const pending = ledger.listFor(targetId).filter(
         row => row.status === 'submitted' || row.status === 'working' || row.status === 'input-required',
       )
-      return { taskId, status: recorded.task.status, queuePosition: pending.length }
+      return { taskId: String(taskId), status: recorded.task.status, queuePosition: pending.length, blockedBy: blocked }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'edit_task',
+    description:
+      'Edit a task you created that has not been dispatched yet: rewrite its requirement text and/or its '
+      + 'DAG predecessors (depends_on). The DAG is program-driven — if you find your flow unreasonable, '
+      + 'fix it here before the task dispatches. A dispatched or running task cannot be edited; cancel and '
+      + 'recreate instead. After the edit, the task dispatches automatically if every dependency has settled.',
+    parameters: {
+      task_id: { type: 'string', required: true, description: 'The undispatched task to edit.' },
+      content: { type: 'string', description: 'New requirement text; omit to keep the current one.' },
+      depends_on: {
+        type: 'array',
+        items: { type: 'string' },
+        description: 'New predecessor list; omit to keep the current one, pass [] to clear all dependencies.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          taskId: { type: 'string', required: true },
+          status: { type: 'string', required: true },
+          blockedBy: { type: 'array', items: { type: 'string' }, required: true },
+        },
+      },
+      render: (_args, result) => [{
+        type: 'text',
+        text: `task ${result.taskId} updated → ${String(result.status)}`
+          + (result.blockedBy.length > 0
+            ? `, awaiting dependencies: ${result.blockedBy.join(', ')}`
+            : ', dependencies satisfied'),
+      }],
+    },
+    presentCall: (args) => ({
+      card: 'generic',
+      title: 'agent-bus:编辑任务',
+      kind: 'other',
+      rawInput: { task_id: args.task_id, ...(args.depends_on !== undefined ? { depends_on: args.depends_on } : {}) },
+    }),
+    presentResult: (_args, result) => ({ card: 'generic', title: 'agent-bus:编辑任务', rawInput: result }),
+    async execute(args, exec) {
+      const callerId = requireCaller(exec.agent, 'edit_task')
+      const taskId = TaskId(args.task_id)
+      const existing = ledger.get(taskId)
+      if (existing === undefined) throw new Error(`no such task "${taskId}"`)
+      if (existing.assignedBy !== callerId) {
+        throw new Error(`only the session that created task "${taskId}" may edit it`)
+      }
+      const patch: { content?: string; dependencies?: TaskId[] } = {}
+      if (args.content !== undefined) {
+        const admitted = admitContent(args.content, config.maxContentLength)
+        if (!admitted.ok) throw new Error(admitted.message)
+        patch.content = admitted.content
+      }
+      if (args.depends_on !== undefined) {
+        patch.dependencies = (args.depends_on as string[]).map(id => TaskId(id))
+      }
+      const edited = await ledger.editTask(taskId, patch)
+      if (!edited.ok) throw new Error(edited.message)
+
+      // Recompute readiness: a dependency edit may have cleared the last
+      // blocker, in which case the task dispatches immediately.
+      const blocked: string[] = [...blockedByOf(edited.task, ledger.listAll()).map(String)]
+      if (blocked.length === 0) {
+        await dispatchOne(ctx, ledger, taskId)
+      }
+      return { taskId: String(taskId), status: edited.task.status, blockedBy: blocked }
     },
   }))
 
   ctx.tools.register(defineTool({
     name: 'list_tasks',
     description:
-      'List tasks in the ledger. Scope inbox (default) shows tasks addressed to you, in the order you '
-      + 'will work them; scope outbox shows tasks you dispatched and their current state. A completed '
-      + 'task includes its report text, so read it before settling. Pass status to filter to one task '
-      + 'state. Use get_task when a listing truncates a long report.',
+      'List the ACTIVE tasks in the ledger. Scope inbox (default) shows work addressed to you, in the '
+      + 'order you will do it; scope outbox shows what you dispatched and its current state. Archived '
+      + 'tasks are invisible by design: a task leaves the listing once it failed, was canceled, or its '
+      + 'settlement is more than 24 hours old — history lives in the panel and session logs. A completed '
+      + 'task awaiting your verdict is still active and includes its report text, so read it before '
+      + 'settling. Pass status to filter to one task state. Use get_task when a listing truncates a '
+      + 'long report.',
     parameters: {
       scope: {
         type: 'string',
@@ -501,6 +749,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       if (args.status !== undefined) {
         rows = rows.filter(row => row.status === args.status)
       }
+      rows = rows.filter(row => isActiveTask(row, Date.now()))
       return rows.map(view)
     },
   }))
@@ -624,7 +873,8 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         ? `${admitted.content.slice(0, 200)}…`
         : admitted.content
       notifySession(ctx, reviewer, taskId,
-        `任务 ${taskId} 已完成,请调用 settle_task 验收。提交结果摘要:${excerpt}`)
+        `任务 ${taskId} 已完成,当前状态为「待验收」,请调用 settle_task 验收。提交结果摘要:${excerpt}`,
+        'report_task')
       return { taskId, status: completed.task.status }
     },
   }))
@@ -676,10 +926,14 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       if (!settled.ok) throw new Error(settled.message)
       // A settled task is terminal: its report moves hot -> cold.
       await deps.reports.archive(taskId)
+      // DAG release: a success verdict frees every dependent whose blockers
+      // cleared. The scheduler listener dispatches them.
       if (outcome === 'success') {
+        ctx.emit('agent-bus/settle', taskId)
         // Result returns to the initiator: the loop closes.
         notifySession(ctx, task.assignedBy, taskId,
-          `任务 ${taskId} 已验收通过(success)。最终结果:${settled.task.report ?? '(无)'}`)
+          `任务 ${taskId} 已验收通过,状态「已完成」(success)。最终结果:${settled.task.report ?? '(无)'}`,
+          'settle_task')
       } else if (task.assignedTo !== undefined) {
         // Rework loop: the worker is woken to execute the SAME task again.
         // The rework notice is a new delivery of the task, so its message id
@@ -687,7 +941,8 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         // cannot find the task and it never leaves `submitted`.
         const instruction = args.feedback !== undefined ? args.feedback : '请根据验收意见重新执行。'
         const reworkNotice = buildTaskMessage(callerId, taskId,
-          `任务 ${taskId} 未通过验收(failure)。修改意见:${instruction}。请重新执行后调用 report_task 再次提交。`)
+          `任务 ${taskId} 验收未通过,已返回「待执行」等待重新执行(failure)。修改意见:${instruction}。请重新执行后调用 report_task 再次提交。`,
+          'settle_task')
         const recorded = await ledger.recordDelivery(taskId, reworkNotice.id)
         if (!recorded.ok) throw new Error(recorded.message)
         const worker = ctx.agents.get(task.assignedTo)
@@ -752,9 +1007,9 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
           // The cancel signal is advisory; a worker that already settled the
           // turn needs no interruption.
         }
-        const note = `任务 ${taskId} 已被派发方取消${reason?.ok === true ? `(${reason.content})` : ''}。`
+        const note = `任务 ${taskId} 状态「已取消」,由派发方取消${reason?.ok === true ? `(${reason.content})` : ''}。`
           + '请用 report_task 提交你已完成部分的摘要。'
-        const summary = buildTaskMessage(callerId, taskId, note)
+        const summary = buildTaskMessage(callerId, taskId, note, 'cancel_task')
         deliverTask(worker, summary, 'followup')
       }
       return { taskId, status: canceled.task.status }

@@ -93,6 +93,38 @@ export class ReportStore {
   }
 
   /**
+   * Whether a report file exists in the hot zone. A missing zone root reads
+   * as an empty zone, never an error.
+   *
+   * @param ref - the report reference (the task id).
+   * @returns `true` when the hot-zone file exists.
+   */
+  async existsHot(ref: string): Promise<boolean> {
+    try {
+      await stat(join(this.hotRoot, `${ref}.md`))
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Whether a report file exists in the cold zone, same tolerance as
+   * {@link existsHot}.
+   *
+   * @param ref - the report reference (the task id).
+   * @returns `true` when the cold-zone file exists.
+   */
+  async existsCold(ref: string): Promise<boolean> {
+    try {
+      await stat(join(this.coldRoot, `${ref}.md`))
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /**
    * Sweep both zones: remove files untouched for the zone's idle window.
    *
    * @returns the number of removed files.
