@@ -109,6 +109,8 @@ export interface SessionView {
   readonly title: string
   readonly workspaceId: string | null
   readonly live: boolean
+  /** Whether the session was archived in the workspace registry. */
+  readonly archived: boolean
 }
 
 /** Full panel snapshot returned by the state route. */
@@ -515,17 +517,23 @@ export function sortActive(tasks: readonly TaskView[]): TaskView[] {
 }
 
 /**
- * Sidebar sessions for one tab. The active tab lists live sessions only (an
- * offline session cannot have active work); the archive tab lists live
- * sessions first — without offline marking — and offline sessions after,
- * which the UI renders as its offline module.
+ * Sidebar sessions for one tab. Every tab lists all unarchived sessions of
+ * the workspace — live rows first — since a task may reference any of them;
+ * the archive tab additionally lists archived sessions at the end, which the
+ * UI renders as its offline module. Archived sessions own no active work, so
+ * they never appear on the active tab.
  */
 export function sessionsForTab(
   sessions: readonly SessionView[],
   archiveMode: boolean,
 ): SessionView[] {
-  if (!archiveMode) return sessions.filter(session => session.live)
-  return [...sessions].sort((left, right) => Number(right.live) - Number(left.live))
+  const unarchived = sessions.filter(session => !session.archived)
+  if (!archiveMode) return unarchived.sort((left, right) => Number(right.live) - Number(left.live))
+  const archived = sessions.filter(session => session.archived)
+  return [
+    ...unarchived.sort((left, right) => Number(right.live) - Number(left.live)),
+    ...archived.sort((left, right) => Number(right.live) - Number(left.live)),
+  ]
 }
 
 /** True when any staff row is missing a task-period token delta. */

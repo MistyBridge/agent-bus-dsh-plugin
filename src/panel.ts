@@ -16,6 +16,7 @@
  * @module dsh-agent-bus/panel
  */
 
+import { stat } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
@@ -52,6 +53,8 @@ export interface SessionView {
   readonly title: string
   readonly workspaceId: string | null
   readonly live: boolean
+  /** Whether the session was archived in the workspace registry. */
+  readonly archived: boolean
 }
 
 /** One participant on a task card's staff directory. */
@@ -365,18 +368,74 @@ export async function buildTaskView(
 }
 
 /**
- * The panel's session directory: live non-subagent sessions that actually
- * hold work, plus any session a task references (added by the caller).
+ * How long a persisted session counts as "recently active" for the panel's
+ * active-people directory (24 hours).
+ */
+export const ACTIVE_WINDOW_MS = 24 * 60 * 60 * 1000
+
+/**
+ * A log file at or below this size holds metadata events only (a seed that
+ * ended without a turn); such blank sessions are excluded from the active
+ * directory just like the harness sidebar hides them.
+ */
+const BLANK_LOG_BYTES = 8 * 1024
+
+/** Cached per-session log probe: the stat calls are disk I/O, throttled. */
+const logProbeCache = new Map<string, { at: number; ok: boolean }>()
+const LOG_PROBE_TTL_MS = 30_000
+
+/** Cached recent-activity probe: the mtime scan is disk I/O, throttled. */
+let activeProbeCache: { at: number; ids: Set<string> } | null = null
+
+/**
+ * Whether a session's log exists on disk with more than metadata (a
+ * substantial, real session). Blank seeds and vanished files return false.
+ * Cached per session id so the 2s poll does not stat every log each tick.
  *
- * Blank sessions — a seed that ended without a single turn — are excluded,
- * exactly like the harness sidebar hides them: the session store keeps the
- * live object, but a session with no user or assistant message is not a
- * conversation peer. Persisted-but-disposed sessions are likewise excluded.
+ * @param ctx - plugin context; the persistence store is optional.
+ * @param sessionId - the session to probe.
+ * @param now - probe clock.
+ */
+async function hasSubstantialLog(ctx: Context, sessionId: string, now: number): Promise<boolean> {
+  const cached = logProbeCache.get(sessionId)
+  if (cached !== undefined && now - cached.at < LOG_PROBE_TTL_MS) return cached.ok
+  const persistence = ctx.get('sessionPersistence') as
+    | { locate(meta: { id: string }): { path: string } | undefined }
+    | undefined
+  // No persistence store (degraded profile): cannot probe, keep the session.
+  if (persistence === undefined) return true
+  let ok = false
+  try {
+    const location = persistence.locate({ id: sessionId as never })
+    if (location !== undefined) {
+      const info = await stat(location.path)
+      ok = info.size > BLANK_LOG_BYTES
+    }
+  } catch {
+    ok = false
+  }
+  logProbeCache.set(sessionId, { at: now, ok })
+  return ok
+}
+
+/**
+ * The session directory: live non-subagent sessions that actually hold work,
+ * plus persisted sessions whose log was written within
+ * {@link ACTIVE_WINDOW_MS} (recently active, offline right now), plus any
+ * session a task references (added by the caller).
+ *
+ * The harness attaches sessions lazily — a restarted host only knows the
+ * sessions a browser has opened — so "live" alone would shrink the directory
+ * to nothing after a restart. The mtime probe restores the recently-active
+ * people without resurrecting the 41-session ghost pile (their logs are
+ * older than the window). Blank sessions (seed without a turn) stay
+ * excluded, mirroring the harness sidebar.
  *
  * @param ctx - plugin context; the session store is optional at runtime.
+ * @param now - probe clock.
  * @returns the authoritative set of visible session ids.
  */
-function visibleSessionIds(ctx: Context): Set<string> {
+async function visibleSessionIds(ctx: Context, now: number): Promise<Set<string>> {
   const sessionStore = ctx.get('sessions') as
     | { list(): { id: string; header: { origin?: string }; events: readonly { type: string }[] }[] }
     | undefined
@@ -388,9 +447,65 @@ function visibleSessionIds(ctx: Context): Set<string> {
         event => event.type === 'user/message' || event.type === 'assistant/message',
       )
       if (!hasTurn) continue
+      // A store entry without a real log on disk is not a conversation peer.
+      if (!await hasSubstantialLog(ctx, session.id, now)) continue
       ids.add(session.id)
     }
   }
+  const active = await recentlyActiveIds(ctx, now)
+  for (const id of active) ids.add(id)
+  // Archived sessions stay visible — the archive tab's offline module is
+  // where they live — but only when they are also attached or recently
+  // active: the registry's archive set accumulates every disposed session,
+  // and a ghost pile must not resurrect on the sidebar.
+  const registry = ctx.get('workspaceRegistry') as { archivedSessionIds?: readonly string[] } | undefined
+  for (const id of registry?.archivedSessionIds ?? []) {
+    if (ids.has(String(id)) || active.has(String(id))) ids.add(String(id))
+  }
+  return ids
+}
+
+/**
+ * Persisted session ids whose log was modified within the active window.
+ * Probed via the persistence store's own `locate`, cached for 30 seconds —
+ * the 2s poll must not stat every log file on every tick.
+ *
+ * @param ctx - plugin context; the persistence store is optional.
+ * @param now - probe clock.
+ * @returns the recently-active session ids.
+ */
+async function recentlyActiveIds(ctx: Context, now: number): Promise<Set<string>> {
+  if (activeProbeCache !== null && now - activeProbeCache.at < 30_000) {
+    return activeProbeCache.ids
+  }
+  const persistence = ctx.get('sessionPersistence') as
+    | { list(): Promise<{ id: string }[]>; locate(meta: { id: string }): { path: string } | undefined }
+    | undefined
+  const ids = new Set<string>()
+  if (persistence !== undefined) {
+    try {
+      for (const meta of await persistence.list()) {
+        const location = persistence.locate(meta)
+        if (location === undefined) continue
+        try {
+          const info = await stat(location.path)
+          if (now - info.mtimeMs >= ACTIVE_WINDOW_MS) continue
+          if (info.size <= BLANK_LOG_BYTES) continue // metadata-only seed
+          ids.add(meta.id)
+        } catch {
+          // No log file on disk: nothing to be active about.
+        }
+      }
+      // Fold the store-probe results into the shared cache so the two paths
+      // agree within one TTL window.
+      for (const id of ids) {
+        if (!logProbeCache.has(id)) logProbeCache.set(id, { at: now, ok: true })
+      }
+    } catch {
+      // Degrade to the live set; the directory is a display concern.
+    }
+  }
+  activeProbeCache = { at: now, ids }
   return ids
 }
 
@@ -442,7 +557,8 @@ export async function buildPanelSnapshot(
       registrySessionWorkspace.set(String(sessionId), String(workspace.id))
     }
   }
-  const visible = visibleSessionIds(ctx)
+  const visible = await visibleSessionIds(ctx, now)
+  const archivedIds = new Set((registry?.archivedSessionIds ?? []).map(String))
   const sessionWorkspace = new Map<string, string>()
   for (const sessionId of visible) {
     sessionWorkspace.set(sessionId, registrySessionWorkspace.get(sessionId) ?? '')
@@ -459,6 +575,7 @@ export async function buildPanelSnapshot(
       title: titles.get(sessionId) ?? fallbackTitle(sessionId),
       workspaceId: workspaceId === '' ? null : workspaceId,
       live: agents?.get(sessionId) !== undefined,
+      archived: archivedIds.has(sessionId),
     })
   }
 
