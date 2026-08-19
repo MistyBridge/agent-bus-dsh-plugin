@@ -579,7 +579,7 @@ export function DagView({
 
   return (
     <div className="abPBody">
-      <nav className="abPSessions" aria-label="会话" style={{ width: sidebarWidth }}>
+      <nav className="abPSessions" aria-label="流程" style={{ width: sidebarWidth }}>
         <div
           className="abPResize"
           role="separator"
@@ -590,62 +590,54 @@ export function DagView({
           onPointerUp={onSidebarResizeUp}
           onPointerCancel={onSidebarResizeUp}
         />
-        <div className="abPAll">
-          <span className="abPAllBtn">活跃流程</span>
-        </div>
-        <div className="abPSessionList">
+        <div className="abPFlowHead">活跃</div>
+        <div className="abPFlowList">
           {activeFlows.length === 0 && (
-            <div className="abPOffline">暂无活跃流程</div>
+            <div className="abPFlowEmpty">暂无活跃流程</div>
           )}
           {activeFlows.map(flow => (
             <button
               key={flow.id}
               type="button"
-              className="abPSession"
+              className="abPFlow"
               data-active={selectedFlowId === flow.id || undefined}
               onClick={() => onSelectFlow(flow.id)}
             >
-              <span className="abPLive" data-on />
-              <span className="abPSessionText">
-                <span className="abPSessionTitle">{flow.name}</span>
-                <span className="abPOffline">{`${flow.unsettledCount}/${flow.taskCount}`}</span>
-              </span>
+              <span className="abPFlowName">{flow.name}</span>
+              <span className="abPFlowCount">{flow.unsettledCount}</span>
             </button>
           ))}
         </div>
-        <div className="abPGroup">
-          <div className="abPAll">
-            <span className="abPAllBtn">归档流程</span>
+        {archivedFlows.length > 0 && (
+          <div className="abPGroup">
+            <div className="abPFlowHead">归档</div>
+            <div className="abPFlowList">
+              {archivedFlows.map(flow => (
+                <button
+                  key={flow.id}
+                  type="button"
+                  className="abPFlow"
+                  data-active={selectedFlowId === flow.id || undefined}
+                  data-archived
+                  onClick={() => onSelectFlow(flow.id)}
+                >
+                  <span className="abPFlowName">{flow.name}</span>
+                </button>
+              ))}
+            </div>
           </div>
-          <div className="abPSessionList">
-            {archivedFlows.map(flow => (
-              <button
-                key={flow.id}
-                type="button"
-                className="abPSession"
-                data-active={selectedFlowId === flow.id || undefined}
-                onClick={() => onSelectFlow(flow.id)}
-              >
-                <span className="abPLive" />
-                <span className="abPSessionText">
-                  <span className="abPSessionTitle">{flow.name}</span>
-                  <span className="abPOffline">{`${flow.taskCount} 已归档`}</span>
-                </span>
-              </button>
-            ))}
-          </div>
-        </div>
+        )}
       </nav>
       <div className="abPDagPane">
         {selectedFlow === null ? (
           <div className="abPEmpty">
-            <div className="abPEmptyTitle">请选择一个流程</div>
-            <div className="abPEmptyHint">DAG 按流程展示，无流程的任务不会出现在这里</div>
+            <div className="abPEmptyTitle">选择一个流程</div>
+            <div className="abPEmptyHint">左侧点选后，这里会画出它的任务图</div>
           </div>
         ) : flowTasks.length === 0 ? (
           <div className="abPEmpty">
-            <div className="abPEmptyTitle">{`${selectedFlow.name} 暂无节点`}</div>
-            <div className="abPEmptyHint">用 create_task 并把 flow_id 指到这个流程</div>
+            <div className="abPEmptyTitle">{`${selectedFlow.name} 还没有任务`}</div>
+            <div className="abPEmptyHint">归入这个流程的任务会出现在画布上</div>
           </div>
         ) : (
           <div
@@ -712,7 +704,7 @@ export function DagView({
                 const blocked = blockedByOf(box.task, flowTasks).length > 0
                 const settledOk = box.task.status === 'completed' && box.task.outcome === 'success'
                 const tone = chainTone.get(box.id)
-                const dim = faded || (focusId !== null && tone === undefined)
+                const dim = !faded && focusId !== null && tone === undefined
                 return (
                   <button
                     key={box.id}
@@ -742,11 +734,11 @@ export function DagView({
                     <span className="abPDagNodeTop">
                       <StatusDot task={box.task} />
                       <StatusBadge task={box.task} />
-                      {mark !== null && <span className="abPDagMark">{mark}</span>}
                     </span>
                     <span className="abPDagNodeLabel">
                       {truncateCodePoints(box.task.contentPreview, 18)}
                     </span>
+                    {mark !== null && <span className="abPDagMark">{mark}</span>}
                   </button>
                 )
               })}

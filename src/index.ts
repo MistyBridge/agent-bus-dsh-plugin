@@ -85,9 +85,15 @@ export const Config: z<Config> = z.object({
 /** The model-facing usage policy. */
 const USAGE_TEXT = `You share a workspace with other agent sessions and can dispatch work to them.
 
+ROUTE BY SCOPE — pick the channel that matches how big the ask is:
+- SMALL (a message, a question, a confirmation, a one-line coordination ping): send_note. No record, no lifecycle, no acceptance — the peer just answers in prose.
+- MEDIUM (one deliverable the peer must produce and you will verify): create_task. Full lifecycle: report → settle → rework/cancel, with timeout backstop.
+- LARGE (a multi-step effort that needs planning and ordering): create_flow. FIRST write out the full plan (what must happen, in what order, by whom), THEN create the flow, then split the plan into tasks created with flow_id and dependencies so the DAG auto-schedules: each task delivers only after its predecessors settle, and a failure propagates down the chain automatically. The flow is your roadmap; the DAG view renders it.
+Never use a heavier channel than the ask needs, and never a lighter one: chat-as-task is how tasks get stuck forever in working; task-as-chat loses the lifecycle that keeps work accountable.
+
 - list_peers shows the live sessions in your workspace: their names, their self-declared cards, and how busy they are. They are the only valid create_task and send_note targets.
-- send_note sends a lightweight note to one peer: a message, a question, a confirmation — anything that is NOT work the peer must deliver a verifiable result for. There is NO task record, NO acceptance, and nothing to report or settle; the peer simply replies in prose, and if it replies it sends a note back to you. When a note you receive carries the <dsh-agent-bus-message> header, treat it as ordinary conversation, not work.
-- create_task creates one task node for a live peer. Use it only for work that must produce a verifiable result: a chat disguised as a task is how tasks get stuck forever in working, because a task waits for report_task and settle_task while a chat expects none. The peer works its delivered tasks one at a time, each as its own turn — you do not need to pace dispatches. dependencies names task ids that must settle before this one is delivered: while any predecessor is unsettled the task stays 待投递(queued) and the scheduler delivers it automatically once every dependency settles. acceptance_criteria states the minimum requirement the reviewer settles against. Passing task_id answers a peer's request_input and lets its paused task resume. Passing reviewer names a different session as the one that settles the result; without it you settle it yourself.
+- send_note (SMALL) sends a lightweight note to one peer: a message, a question, a confirmation — anything that is NOT work the peer must deliver a verifiable result for. There is NO task record, NO acceptance, and nothing to report or settle; the peer simply replies in prose, and if it replies it sends a note back to you. When a note you receive carries the <dsh-agent-bus-message> header, treat it as ordinary conversation, not work.
+- create_task (MEDIUM) creates one task node for a live peer: work that must produce a verifiable result you will review. The peer works its delivered tasks one at a time, each as its own turn — you do not need to pace dispatches. dependencies names task ids that must settle before this one is delivered: while any predecessor is unsettled the task stays 待投递(queued) and the scheduler delivers it automatically once every dependency settles. acceptance_criteria states the minimum requirement the reviewer settles against. Passing task_id answers a peer's request_input and lets its paused task resume. Passing reviewer names a different session as the one that settles the result; without it you settle it yourself.
 - list_tasks with scope=inbox shows the ACTIVE work assigned to you, in the order you will do it. With scope=outbox it shows what you initiated. Archived tasks are invisible by design: a task leaves the listing once it failed, was canceled, or its settlement is more than 24 hours old — history lives in the panel and session logs. Completed tasks awaiting your verdict are still active and carry the worker's report, so read it before settling. Pass status to filter.
 - get_task reads one task's full record, including the complete report and question text.
 - report_task is the worker's way to finish: a working task becomes completed and the reviewer is notified to settle it. If the task was canceled, report_task attaches your work summary instead.
@@ -97,7 +103,7 @@ const USAGE_TEXT = `You share a workspace with other agent sessions and can disp
 - cancel_task is the initiator's way to stop a task that is still submitted, working, or awaiting input. The worker is interrupted and asked for a summary, which lands on the canceled task.
 - request_input pauses a task you are working on when you need information only the initiator has; they answer with create_task passing task_id.
 - update_card maintains your own capability card: a description for other agents and machine-readable capabilities for routing.
-- To orchestrate a flow, split the work into tasks and create them with dependencies: each task names the tasks that must settle before it is delivered. A task with unsettled dependencies is created 待投递(queued) — the scheduler delivers it automatically once every dependency settles, and failure propagates down the chain automatically when a dependency fails terminally. edit_task rewrites an undispatched task's requirement, acceptance criteria, or dependencies if the DAG turns out wrong.
+- create_flow (LARGE) creates the roadmap container: plan first, then split the plan into tasks created with flow_id and dependencies. A task with unsettled dependencies is created 待投递(queued) — the scheduler delivers it automatically once every dependency settles, and failure propagates down the chain automatically when a dependency fails terminally. edit_task rewrites an undispatched task's requirement, acceptance criteria, dependencies, or flow membership if the DAG turns out wrong. The DAG view renders one flow at a time; flow-less tasks never appear there.
 
 Incoming agent-bus messages open with a header naming the request kind, so read it first:
 - <dsh-agent-bus task="…" tool="create_task" sender="…"> — a task to work; do it and call report_task with that task id.
@@ -111,7 +117,7 @@ Only the reviewer can settle and only the initiator can cancel, so never mark yo
 
 Delivery reaches live sessions only. A refusal from create_task is authoritative: the peer is not reachable, not in your workspace, or its queue is full.
 
-Tools: list_peers, send_note, create_task, edit_task, list_tasks, get_task, report_task, settle_task, cancel_task, request_input, update_card`
+Tools: list_peers, send_note, create_flow, create_task, edit_task, list_flows, list_tasks, get_task, report_task, settle_task, cancel_task, request_input, update_card`
 
 /**
  * Mount the gateway.

@@ -425,14 +425,14 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
     // control), so the peer channel must not collide with it.
     name: 'send_note',
     description:
-      'Send a lightweight note to a live peer in your workspace: a message, a question, a '
-      + 'confirmation, a coordination ping — anything that is NOT work the peer must deliver a '
-      + 'verifiable result for. The note lands in the peer\'s inbox like an ordinary message; '
-      + 'there is NO task record, no acceptance, and nothing to report or settle. The peer simply '
-      + 'replies in prose (with send_note back to you, if it replies at all). Use create_task '
-      + 'instead when the peer must produce a result you will verify — a note channel needs no '
-      + 'lifecycle, and a task channel whose work was really a chat is how tasks get stuck forever '
-      + 'in working.',
+      'SMALL scope: send a lightweight note to a live peer in your workspace — a message, a '
+      + 'question, a confirmation, a coordination ping; anything that is NOT work the peer must '
+      + 'deliver a verifiable result for. The note lands in the peer\'s inbox like an ordinary '
+      + 'message; there is NO task record, no acceptance, and nothing to report or settle. The '
+      + 'peer simply replies in prose (with send_note back to you, if it replies at all). Use '
+      + 'create_task instead when the peer must produce a result you will verify — a note channel '
+      + 'needs no lifecycle, and a task channel whose work was really a chat is how tasks get '
+      + 'stuck forever in working.',
     parameters: {
       target: { type: 'string', required: true, description: 'Session id of the peer, from list_peers.' },
       content: { type: 'string', required: true, description: 'The note text.' },
@@ -479,11 +479,14 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
   ctx.tools.register(defineTool({
     name: 'create_flow',
     description:
-      'Create a flow: a named DAG container that groups related tasks into one dependency graph. '
-      + 'Create tasks with flow_id to join it; every dependency of a task must live in the same flow '
-      + '(add the task to the flow first with edit_task flow_id), so one flow is always one DAG and '
-      + 'cross-flow references are impossible. The DAG view renders per flow; a flow whose tasks are '
-      + 'all archived moves to the archived section automatically.',
+      'LARGE scope: create a flow — the roadmap container for a multi-step effort. FIRST write out '
+      + 'the full plan (what must happen, in what order, by whom, what "done" means for each step), '
+      + 'THEN create the flow, then split the plan into tasks created with flow_id and dependencies '
+      + 'so the DAG auto-schedules: each task delivers only after its predecessors settle, and a '
+      + 'failure propagates down the chain automatically. Every dependency of a task must live in '
+      + 'the same flow (add the task to the flow first with edit_task flow_id), so one flow is '
+      + 'always one DAG and cross-flow references are impossible. The DAG view renders per flow; a '
+      + 'flow whose tasks are all archived moves to the archived section automatically.',
     parameters: {
       name: { type: 'string', required: true, description: 'Flow display name, 1–80 characters.' },
       description: { type: 'string', description: 'Optional note about the flow.' },
@@ -591,16 +594,18 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
   ctx.tools.register(defineTool({
     name: 'create_task',
     description:
-      'Create one task node for a live peer in your workspace. The task is recorded in the ledger; a '
-      + 'task whose dependencies are already settled is delivered to the peer\'s queue in one step, and '
-      + 'a task with unsettled dependencies is created as 待投递(queued) and delivered automatically by '
-      + 'the scheduler once every dependency settles — no pacing needed. The peer works delivered tasks '
+      'MEDIUM scope: create one task node for a live peer in your workspace — a single deliverable '
+      + 'the peer must produce and you will review. The task is recorded in the ledger; a task whose '
+      + 'dependencies are already settled is delivered to the peer\'s queue in one step, and a task '
+      + 'with unsettled dependencies is created as 待投递(queued) and delivered automatically by the '
+      + 'scheduler once every dependency settles — no pacing needed. The peer works delivered tasks '
       + 'one at a time, each as its own turn. You become the task\'s initiator. By default you also '
       + 'review its result; pass reviewer to name a different session as the one that settles it. '
-      + 'acceptance_criteria is the minimum requirement the reviewer settles against. A rejected result '
-      + 'sends the SAME task back to the worker for rework — the task id never changes across attempts. '
-      + 'To answer a peer\'s request_input, pass task_id — your message becomes the answer and the task '
-      + 'resumes. Use mode=steer only when the news invalidates what the peer is doing right now.',
+      + 'acceptance_criteria is the minimum requirement the reviewer settles against. A rejected '
+      + 'result sends the SAME task back to the worker for rework — the task id never changes across '
+      + 'attempts. To answer a peer\'s request_input, pass task_id — your message becomes the answer '
+      + 'and the task resumes. Use mode=steer only when the news invalidates what the peer is doing '
+      + 'right now. For a multi-step effort, use create_flow instead and build the DAG.',
     parameters: {
       target: { type: 'string', required: true, description: 'Session id of the peer, from list_peers.' },
       content: { type: 'string', required: true, description: 'The task instruction or answer.' },
