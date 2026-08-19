@@ -157,6 +157,7 @@ interface TaskDetailView {
   readonly to?: string
   readonly content: string
   readonly acceptanceCriteria?: string
+  readonly handoffs?: readonly { fromTask: string; document: string; at: string }[]
   readonly report?: string
   readonly question?: string
   readonly outcome?: string
@@ -176,6 +177,13 @@ function detailView(task: TaskRecord): TaskDetailView {
     ...(task.assignedTo !== undefined ? { to: task.assignedTo } : {}),
     content: task.content,
     ...(task.acceptanceCriteria !== undefined ? { acceptanceCriteria: task.acceptanceCriteria } : {}),
+    ...(task.handoffs !== undefined
+      ? { handoffs: task.handoffs.map(handoff => ({
+        fromTask: String(handoff.fromTask),
+        document: handoff.document,
+        at: handoff.at,
+      })) }
+      : {}),
     ...(task.report !== undefined ? { report: task.report } : {}),
     ...(task.question !== undefined ? { question: task.question } : {}),
     ...(task.outcome !== undefined ? { outcome: task.outcome } : {}),
@@ -234,6 +242,12 @@ export function renderTaskDetail(t: TaskDetailView): string {
     t.content,
   ]
   if (t.acceptanceCriteria !== undefined) lines.push('acceptance criteria:', t.acceptanceCriteria)
+  if (t.handoffs !== undefined && t.handoffs.length > 0) {
+    lines.push('handoff documents:')
+    for (const handoff of t.handoffs) {
+      lines.push(`  from ${handoff.fromTask}:`, handoff.document)
+    }
+  }
   if (t.question !== undefined) lines.push('question:', t.question)
   if (t.report !== undefined) lines.push('submitted result:', t.report)
   if (t.outcome !== undefined) lines.push(`verdict: ${t.outcome}`)
@@ -1066,6 +1080,18 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
           to: { type: 'string' },
           content: { type: 'string', required: true },
           acceptanceCriteria: { type: 'string' },
+          handoffs: {
+            type: 'array',
+            items: {
+              type: 'object',
+              additionalProperties: false,
+              properties: {
+                fromTask: { type: 'string', required: true },
+                document: { type: 'string', required: true },
+                at: { type: 'string', required: true },
+              },
+            },
+          },
           report: { type: 'string' },
           question: { type: 'string' },
           outcome: { type: 'string' },
