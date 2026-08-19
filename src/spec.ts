@@ -76,6 +76,8 @@ export const taskRecord = z.object({
   reason: z.string().optional(),
   retries: z.number().int().nonnegative(),
   tokensAtStart: z.record(sessionId, tokenBuckets).optional(),
+  dependencies: z.array(taskId).max(16).optional(),
+  auto: z.boolean().optional(),
   createdAt: z.string(),
   updatedAt: z.string(),
 })
@@ -111,17 +113,16 @@ export type AgentBusDomainState = z.infer<typeof agentBusDomainState>
 
 /**
  * The agent-bus domain spec: a `tasks` table keyed by task id, a `peers`
- * table keyed by session id, plus the order singleton. Version 5 adds the
- * dispatch-time token snapshot (`tokensAtStart`) the task-period consumption
- * deltas are computed from; the field is optional, so rows written by v4
- * parse unchanged, but the version bump still invalidates the storage unit —
- * delete `agent_bus.json` (or let the backend refuse) once after upgrading,
- * the same pre-release discipline v3/v4 followed. No migration for
- * pre-release data.
+ * table keyed by session id, plus the order singleton. Version 6 adds the DAG
+ * fields (`dependencies`, `auto`) for flow orchestration; both are optional,
+ * so rows written by v5 parse unchanged, but the version bump still
+ * invalidates the storage unit — delete `agent_bus.json` once after
+ * upgrading, the same pre-release discipline earlier versions followed. No
+ * migration for pre-release data.
  */
 export const agentBusDomainSpec = defineDomain({
   name: 'agent_bus',
-  version: 5,
+  version: 6,
   global: {
     schema: agentBusDomainState,
     initial: { taskIds: [] },

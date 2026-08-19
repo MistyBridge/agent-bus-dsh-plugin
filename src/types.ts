@@ -136,6 +136,14 @@ export interface TaskRecord {
    * projection minus this snapshot; absent sessions were offline at dispatch.
    */
   readonly tokensAtStart?: Record<string, TokenBuckets>
+  /**
+   * DAG predecessors: task ids that must settle (outcome success) before this
+   * task may be dispatched. Written at creation, editable via edit_task while
+   * the task is undispatched; the ledger rejects cycles and self-references.
+   */
+  readonly dependencies?: readonly TaskId[]
+  /** Set when the scheduler auto-dispatched this task after its dependencies cleared. */
+  readonly auto?: boolean
   /** ISO-8601 creation stamp. */
   readonly createdAt: string
   /** ISO-8601 stamp of the last status change. */
