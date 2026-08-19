@@ -22,7 +22,7 @@ import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import type { Session } from '@deepseek-ai/dsh-session'
 import type { WorkspaceRegistry, Workspace } from '@deepseek-ai/dsh-workspace'
 import type { ReportStore } from './external.ts'
-import type { TaskLedger } from './ledger.ts'
+import { blockedByOf, type TaskLedger } from './ledger.ts'
 import type { TaskRecord, TokenBuckets } from './types.ts'
 import { fallbackTitle, readTitlesFile } from './titles.ts'
 
@@ -97,6 +97,14 @@ export interface TaskView {
    * never computes the age client-side.
    */
   readonly archived: boolean
+  /** DAG predecessors (task ids), in declaration order; empty when none. */
+  readonly dependencies: readonly string[]
+  /** Tasks that depend on this one (reverse edges for the DAG view). */
+  readonly dependents: readonly string[]
+  /** Unsettled dependencies; empty means the task is ready to dispatch. */
+  readonly blockedBy: readonly string[]
+  /** Whether the scheduler (not a tool call) delivered this task. */
+  readonly auto: boolean
   readonly createdAt: string
   readonly updatedAt: string
   readonly ageMs: number
@@ -324,6 +332,7 @@ export async function buildTaskView(
     workspacePath: task.workspacePath,
     status: task.status,
     settled: isSettled(task),
+    dependencies: [...(task.dependencies ?? [])],
     content: task.content,
     contentPreview: truncateCodePoints(task.content, 120),
     mode: task.mode,
@@ -345,6 +354,9 @@ export async function buildTaskView(
     taskTokensTotal: sumTokens(staff.map(entry => entry.tokensInTask)),
     executorLive: task.assignedTo !== undefined && agents?.get(task.assignedTo) !== undefined,
     archived: isSettled(task) && now - Date.parse(task.updatedAt) >= ARCHIVE_AGE_MS,
+    dependents: [],
+    blockedBy: [],
+    auto: task.auto === true,
     createdAt: task.createdAt,
     updatedAt: task.updatedAt,
     ageMs: Math.max(0, now - Date.parse(task.createdAt)),
@@ -452,7 +464,8 @@ export async function buildPanelSnapshot(
 
   const tasks: TaskView[] = []
   const stats = emptyStats()
-  for (const task of ledger.listAll()) {
+  const allRows = ledger.listAll()
+  for (const task of allRows) {
     const view = await buildTaskView(task, titles, agents, projections, reports, now)
     tasks.push(view)
     stats.total += 1
@@ -467,6 +480,19 @@ export async function buildPanelSnapshot(
         break
       default:
         break
+    }
+  }
+  // DAG columns need the whole table: reverse edges and unsettled blockers.
+  const rowById = new Map(allRows.map(row => [String(row.id), row]))
+  for (let index = 0; index < tasks.length; index++) {
+    const view = tasks[index]!
+    const row = rowById.get(view.id)
+    tasks[index] = {
+      ...view,
+      dependents: allRows
+        .filter(item => (item.dependencies ?? []).some(dep => String(dep) === view.id))
+        .map(item => String(item.id)),
+      blockedBy: row === undefined ? [] : [...blockedByOf(row, allRows).map(String)],
     }
   }
 

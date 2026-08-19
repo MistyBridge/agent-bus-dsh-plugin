@@ -26,9 +26,10 @@ import type { Session } from '@deepseek-ai/dsh-session'
 import { authorizePeer, authorizeSettlement, resolveWorkspacePath } from './authorize.ts'
 import { admitContent, buildTaskMessage, deliverTask } from './delivery.ts'
 import type { ReportStore } from './external.ts'
-import type { TaskLedger } from './ledger.ts'
+import { blockedByOf, type TaskLedger } from './ledger.ts'
 import { isTokenBuckets, staffRoles } from './panel.ts'
 import { DispatchRateLimiter } from './rate-limit.ts'
+import { dispatchOne } from './scheduler.ts'
 import { TaskId, type DeliveryMode, type TaskRecord, type TokenBuckets } from './types.ts'
 
 /** Resolved plugin configuration the tools read. */
@@ -58,6 +59,7 @@ interface TaskView {
   readonly report?: string
   readonly outcome?: string
   readonly reason?: string
+  readonly dependencies?: string[]
   readonly retries: number
 }
 
@@ -73,6 +75,7 @@ function view(task: TaskRecord): TaskView {
     ...(task.report !== undefined ? { report: task.report } : {}),
     ...(task.outcome !== undefined ? { outcome: task.outcome } : {}),
     ...(task.reason !== undefined ? { reason: task.reason } : {}),
+    ...(task.dependencies !== undefined ? { dependencies: task.dependencies.map(String) } : {}),
     retries: task.retries,
   }
 }
@@ -94,7 +97,10 @@ export function renderTaskRow(t: TaskView): string {
     : ''
   const verdict = t.outcome !== undefined ? `\n  verdict: ${t.outcome}` : ''
   const reason = t.reason !== undefined ? `\n  reason: ${t.reason}` : ''
-  return head + report + verdict + reason
+  const deps = t.dependencies !== undefined && t.dependencies.length > 0
+    ? `\n  depends on: ${t.dependencies.join(', ')}`
+    : ''
+  return head + report + verdict + reason + deps
 }
 
 /** Model-facing projection of one full task record. */
@@ -387,6 +393,14 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         type: 'string',
         description: 'Answering a request_input: the input-required task id. The message answers its question.',
       },
+      depends_on: {
+        type: 'array',
+        items: { type: 'string' },
+        maxItems: 16,
+        description: 'DAG predecessors: task ids that must settle before this one is dispatched. '
+          + 'When any predecessor is unsettled the task is only created — the scheduler dispatches '
+          + 'it automatically once every dependency settles. Edit it with edit_task before it dispatches.',
+      },
     },
     output: {
       schema: {
@@ -396,12 +410,16 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
           taskId: { type: 'string', required: true },
           status: { type: 'string', required: true },
           queuePosition: { type: 'number', required: true },
+          blockedBy: { type: 'array', items: { type: 'string' }, required: true },
         },
       },
       render: (_args, result) => [{
         type: 'text',
         text: `task ${result.taskId} → ${String(result.status)}, `
-          + `${String(result.queuePosition)} unfinished task(s) in that queue`,
+          + `${String(result.queuePosition)} unfinished task(s) in that queue`
+          + (result.blockedBy.length > 0
+            ? `, awaiting dependencies: ${result.blockedBy.join(', ')}`
+            : ''),
       }],
     },
     presentCall: (args) => ({ card: 'generic', title: 'agent-bus:派发任务', kind: 'other', rawInput: { target: args.target, ...(args.reviewer !== undefined ? { reviewer: args.reviewer } : {}), ...(args.task_id !== undefined ? { task_id: args.task_id } : {}) } }),
@@ -440,7 +458,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         const pending = ledger.listFor(targetId).filter(
           row => row.status === 'submitted' || row.status === 'working' || row.status === 'input-required',
         )
-        return { taskId, status: 'input-required', queuePosition: pending.length }
+        return { taskId: String(taskId), status: 'input-required', queuePosition: pending.length, blockedBy: [] as string[] }
       }
 
       // Dispatch path: a fresh task. Reviewer defaults to the initiator.
@@ -451,6 +469,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         if (!reviewerDecision.ok) throw new Error(reviewerDecision.message)
         reviewer = args.reviewer as SessionId
       }
+      const dependencies = (args.depends_on as string[] | undefined)?.map(id => TaskId(id))
       const message = buildTaskMessage(callerId, taskId, admitted.content)
       const tokensAtStart = snapshotTokensAtDispatch(ctx, callerId, targetId, reviewer)
       const recorded = await ledger.record({
@@ -461,17 +480,99 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         workspacePath: decision.workspacePath,
         content: admitted.content,
         mode,
-        messageId: message.id,
         retries: 0,
         ...(tokensAtStart !== undefined ? { tokensAtStart } : {}),
+        ...(dependencies !== undefined ? { dependencies } : {}),
       }, config.maxPendingPerAgent)
       if (!recorded.ok) throw new Error(recorded.message)
 
-      deliverTask(decision.target, message, mode)
+      // A task with dependencies is created without delivery until every
+      // predecessor settles; the scheduler dispatches it then. A task whose
+      // dependencies are already settled delivers immediately, recording the
+      // message id before the inbox can claim it.
+      const blocked: string[] = dependencies === undefined
+        ? []
+        : [...blockedByOf(recorded.task, ledger.listAll()).map(String)]
+      if (blocked.length === 0) {
+        await ledger.recordDelivery(taskId, message.id)
+        deliverTask(decision.target, message, mode)
+      }
       const pending = ledger.listFor(targetId).filter(
         row => row.status === 'submitted' || row.status === 'working' || row.status === 'input-required',
       )
-      return { taskId, status: recorded.task.status, queuePosition: pending.length }
+      return { taskId: String(taskId), status: recorded.task.status, queuePosition: pending.length, blockedBy: blocked }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'edit_task',
+    description:
+      'Edit a task you created that has not been dispatched yet: rewrite its requirement text and/or its '
+      + 'DAG predecessors (depends_on). The DAG is program-driven — if you find your flow unreasonable, '
+      + 'fix it here before the task dispatches. A dispatched or running task cannot be edited; cancel and '
+      + 'recreate instead. After the edit, the task dispatches automatically if every dependency has settled.',
+    parameters: {
+      task_id: { type: 'string', required: true, description: 'The undispatched task to edit.' },
+      content: { type: 'string', description: 'New requirement text; omit to keep the current one.' },
+      depends_on: {
+        type: 'array',
+        items: { type: 'string' },
+        maxItems: 16,
+        description: 'New predecessor list; omit to keep the current one, pass [] to clear all dependencies.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          taskId: { type: 'string', required: true },
+          status: { type: 'string', required: true },
+          blockedBy: { type: 'array', items: { type: 'string' }, required: true },
+        },
+      },
+      render: (_args, result) => [{
+        type: 'text',
+        text: `task ${result.taskId} updated → ${String(result.status)}`
+          + (result.blockedBy.length > 0
+            ? `, awaiting dependencies: ${result.blockedBy.join(', ')}`
+            : ', dependencies satisfied'),
+      }],
+    },
+    presentCall: (args) => ({
+      card: 'generic',
+      title: 'agent-bus:编辑任务',
+      kind: 'other',
+      rawInput: { task_id: args.task_id, ...(args.depends_on !== undefined ? { depends_on: args.depends_on } : {}) },
+    }),
+    presentResult: (_args, result) => ({ card: 'generic', title: 'agent-bus:编辑任务', rawInput: result }),
+    async execute(args, exec) {
+      const callerId = requireCaller(exec.agent, 'edit_task')
+      const taskId = TaskId(args.task_id)
+      const existing = ledger.get(taskId)
+      if (existing === undefined) throw new Error(`no such task "${taskId}"`)
+      if (existing.assignedBy !== callerId) {
+        throw new Error(`only the session that created task "${taskId}" may edit it`)
+      }
+      const patch: { content?: string; dependencies?: TaskId[] } = {}
+      if (args.content !== undefined) {
+        const admitted = admitContent(args.content, config.maxContentLength)
+        if (!admitted.ok) throw new Error(admitted.message)
+        patch.content = admitted.content
+      }
+      if (args.depends_on !== undefined) {
+        patch.dependencies = (args.depends_on as string[]).map(id => TaskId(id))
+      }
+      const edited = await ledger.editTask(taskId, patch)
+      if (!edited.ok) throw new Error(edited.message)
+
+      // Recompute readiness: a dependency edit may have cleared the last
+      // blocker, in which case the task dispatches immediately.
+      const blocked: string[] = [...blockedByOf(edited.task, ledger.listAll()).map(String)]
+      if (blocked.length === 0) {
+        await dispatchOne(ctx, ledger, taskId)
+      }
+      return { taskId: String(taskId), status: edited.task.status, blockedBy: blocked }
     },
   }))
 
@@ -718,7 +819,10 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       if (!settled.ok) throw new Error(settled.message)
       // A settled task is terminal: its report moves hot -> cold.
       await deps.reports.archive(taskId)
+      // DAG release: a success verdict frees every dependent whose blockers
+      // cleared. The scheduler listener dispatches them.
       if (outcome === 'success') {
+        ctx.emit('agent-bus/settle', taskId)
         // Result returns to the initiator: the loop closes.
         notifySession(ctx, task.assignedBy, taskId,
           `任务 ${taskId} 已验收通过(success)。最终结果:${settled.task.report ?? '(无)'}`)

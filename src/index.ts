@@ -37,7 +37,9 @@ import { ReportStore } from './external.ts'
 import { TaskLedger } from './ledger.ts'
 import { buildPanelSnapshot } from './panel.ts'
 import { DispatchRateLimiter } from './rate-limit.ts'
+import { dispatchReadyTasks, releaseDependents } from './scheduler.ts'
 import { notifySession, registerAgentBusTools, type ToolsConfig } from './tools.ts'
+import { TaskId } from './types.ts'
 
 export const name = 'agent-bus'
 
@@ -91,12 +93,13 @@ const USAGE_TEXT = `You share a workspace with other agent sessions and can disp
 - cancel_task is the initiator's way to stop a task that is still submitted, working, or awaiting input. The worker is interrupted and asked for a summary, which lands on the canceled task.
 - request_input pauses a task you are working on when you need information only the initiator has; they answer with dispatch_task passing task_id.
 - update_card maintains your own capability card: a description for other agents and machine-readable capabilities for routing.
+- To orchestrate a flow, split the work into tasks and dispatch them with depends_on: each task names the tasks that must settle before it. A task with unsettled dependencies is only created — the scheduler dispatches it automatically once its dependencies settle, and failure propagates down the chain automatically when a dependency fails terminally. edit_task rewrites an undispatched task's requirement or dependencies if the DAG turns out wrong.
 
 When you receive a task, it arrives as an ordinary message with a <dsh-agent-bus> header naming the sender and task id. Do the work, then call report_task with that task id. When a notice tells you a task you review is completed, settle it promptly; when a notice tells you your task failed review, rework it and report again. Only the reviewer can settle and only the initiator can cancel, so never mark your own work complete.
 
 Delivery reaches live sessions only. A refusal from dispatch_task is authoritative: the peer is not reachable, not in your workspace, or its queue is full.
 
-Tools: list_peers, dispatch_task, list_tasks, get_task, report_task, settle_task, cancel_task, request_input, update_card`
+Tools: list_peers, dispatch_task, edit_task, list_tasks, get_task, report_task, settle_task, cancel_task, request_input, update_card`
 
 /**
  * Mount the gateway.
@@ -193,6 +196,21 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       void ledger.transition(task.id, 'failed', { reason: 'discarded' })
     }
   })
+
+  // DAG auto-scheduling: settle success releases every dependent whose
+  // blockers cleared; a startup sweep restores pending releases after a
+  // restart; a periodic backstop covers anything the event path missed
+  // (delivery failure, edge races). All idempotent — an undelivered row is
+  // the only one ever dispatched.
+  ctx.on('agent-bus/settle', (taskId: string) => {
+    void releaseDependents(ctx, ledger, TaskId(taskId))
+  })
+  void dispatchReadyTasks(ctx, ledger)
+  const dagSweep = setInterval(() => {
+    void dispatchReadyTasks(ctx, ledger)
+  }, 60_000)
+  dagSweep.unref?.()
+  ctx.effect(() => () => clearInterval(dagSweep), 'agent-bus.dagSweep')
 
   // Timeout sweep: a working row whose claimed step was rejected neither
   // reports nor discards, so only time can close it. An unanswered
