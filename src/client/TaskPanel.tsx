@@ -1,5 +1,6 @@
 /**
- * Read-only v1.1 task panel: capsule → hover preview → click drawer.
+ * Workbench: capsule → 3×3 launcher → sticky-note feature windows.
+ * The existing task list is the first feature window.
  *
  * Styles live in TaskPanel.module.css. This pipeline compiles client sources
  * through tsc then tsdown (no lightningcss CSS-modules plugin), so the sheet
@@ -30,7 +31,6 @@ import {
   archiveAgents,
   activeTabTasks,
   archiveTabTasks,
-  recentActivity,
   relativeTime,
   sessionsOfWorkspace,
   sortActive,
@@ -39,7 +39,6 @@ import {
   statusTone,
   tasksOfSession,
   tasksOfWorkspace,
-  truncateCodePoints,
   type PanelSnapshot,
   type TaskView,
   type TokenBuckets,
@@ -52,10 +51,31 @@ const SIDEBAR_KEY = 'dsh-agent-bus.sidebar-width'
 const SIDEBAR_MIN = 128
 const SIDEBAR_MAX = 280
 const SIDEBAR_DEFAULT = 160
+const NOTE_KEY = 'dsh-agent-bus.note.tasks'
+const NOTE_MIN_W = 360
+const NOTE_MIN_H = 320
 const POLL_MS = 2000
-const PREVIEW_SHOW_MS = 180
-const PREVIEW_HIDE_MS = 2000
 const STYLE_ID = 'dsh-agent-bus-panel-styles'
+
+const LAUNCHER_TILES: readonly { id: string; label: string; ready: boolean }[] = [
+  { id: 'tasks', label: '任务', ready: true },
+  { id: 'soon-1', label: '预留', ready: false },
+  { id: 'soon-2', label: '预留', ready: false },
+  { id: 'soon-3', label: '预留', ready: false },
+  { id: 'soon-4', label: '预留', ready: false },
+  { id: 'soon-5', label: '预留', ready: false },
+  { id: 'soon-6', label: '预留', ready: false },
+  { id: 'soon-7', label: '预留', ready: false },
+  { id: 'soon-8', label: '预留', ready: false },
+]
+
+interface NoteGeom {
+  readonly x: number
+  readonly y: number
+  readonly w: number
+  readonly h: number
+  readonly pinned: boolean
+}
 
 const ROLE_LABEL = {
   initiator: '发起',
@@ -102,6 +122,49 @@ function readSidebarWidth(): number {
 function writeSidebarWidth(width: number): void {
   try {
     localStorage.setItem(SIDEBAR_KEY, String(width))
+  } catch {
+    /* private mode */
+  }
+}
+
+function defaultNoteGeom(): NoteGeom {
+  const w = 520
+  const h = Math.min(620, Math.max(NOTE_MIN_H, window.innerHeight - 96))
+  return {
+    x: Math.max(16, window.innerWidth - w - 72),
+    y: Math.max(24, Math.round((window.innerHeight - h) / 2)),
+    w,
+    h,
+    pinned: false,
+  }
+}
+
+function clampNoteGeom(geom: NoteGeom): NoteGeom {
+  const w = Math.min(Math.max(NOTE_MIN_W, geom.w), Math.max(NOTE_MIN_W, window.innerWidth - 24))
+  const h = Math.min(Math.max(NOTE_MIN_H, geom.h), Math.max(NOTE_MIN_H, window.innerHeight - 24))
+  const x = Math.min(Math.max(8, geom.x), Math.max(8, window.innerWidth - 80))
+  const y = Math.min(Math.max(8, geom.y), Math.max(8, window.innerHeight - 40))
+  return { x, y, w, h, pinned: geom.pinned }
+}
+
+function readNoteGeom(): NoteGeom {
+  try {
+    const raw = localStorage.getItem(NOTE_KEY)
+    if (raw === null) return defaultNoteGeom()
+    const parsed = JSON.parse(raw) as Partial<NoteGeom>
+    return clampNoteGeom({
+      ...defaultNoteGeom(),
+      ...parsed,
+      pinned: parsed.pinned === true,
+    })
+  } catch {
+    return defaultNoteGeom()
+  }
+}
+
+function writeNoteGeom(geom: NoteGeom): void {
+  try {
+    localStorage.setItem(NOTE_KEY, JSON.stringify(geom))
   } catch {
     /* private mode */
   }
@@ -347,6 +410,15 @@ function TaskFloat({
 const css = {
   abPRoot: 'abPRoot',
   abPCapsule: 'abPCapsule',
+  abPLauncher: 'abPLauncher',
+  abPLaunchTile: 'abPLaunchTile',
+  abPLaunchMark: 'abPLaunchMark',
+  abPNote: 'abPNote',
+  abPNoteBar: 'abPNoteBar',
+  abPNoteTitle: 'abPNoteTitle',
+  abPNotePin: 'abPNotePin',
+  abPNoteBody: 'abPNoteBody',
+  abPNoteGrip: 'abPNoteGrip',
   abPCapsuleCount: 'abPCapsuleCount',
   abPCapsuleMeta: 'abPCapsuleMeta',
   abPCapsuleDot: 'abPCapsuleDot',
@@ -412,14 +484,19 @@ const css = {
 } as const
 
 /**
- * Capsule / preview / drawer shell. Polls the host snapshot every 2s.
+ * Capsule opens the launcher; 任务 opens a sticky-note window.
  */
 export function TaskPanel({ sessionsList }: TaskPanelProps): JSX.Element {
   useLayoutEffect(() => { ensurePanelStyles() }, [])
   const { snapshot, loading } = usePanelSnapshot()
   const currentSessionId = useCurrentSessionId(sessionsList)
-  const [open, setOpen] = useState(false)
-  const [preview, setPreview] = useState(false)
+  const [launcherOpen, setLauncherOpen] = useState(false)
+  const [taskNoteOpen, setTaskNoteOpen] = useState(() => readNoteGeom().pinned)
+  const [noteGeom, setNoteGeom] = useState(readNoteGeom)
+  const noteGeomRef = useRef(noteGeom)
+  noteGeomRef.current = noteGeom
+  const noteDrag = useRef<{ originX: number; originY: number; startX: number; startY: number } | null>(null)
+  const noteResize = useRef<{ originX: number; originY: number; startW: number; startH: number } | null>(null)
   const [wsMenu, setWsMenu] = useState(false)
   const [sessionFilter, setSessionFilter] = useState<string | null>(null)
   const [archiveMode, setArchiveMode] = useState(false)
@@ -431,8 +508,6 @@ export function TaskPanel({ sessionsList }: TaskPanelProps): JSX.Element {
   const floatRef = useRef<HTMLElement | null>(null)
   const [storedWorkspace, setStoredWorkspace] = useState<string | null>(readStoredWorkspace)
   const [nowMs, setNowMs] = useState(() => Date.now())
-  const showTimer = useRef(0)
-  const hideTimer = useRef(0)
   const rootRef = useRef<HTMLDivElement>(null)
   const [sidebarWidth, setSidebarWidth] = useState(readSidebarWidth)
   const sidebarWidthRef = useRef(sidebarWidth)
@@ -479,7 +554,6 @@ export function TaskPanel({ sessionsList }: TaskPanelProps): JSX.Element {
   )
 
   const activeCount = useMemo(() => activeTabTasks(workspaceTasks).length, [workspaceTasks])
-  const previewRows = useMemo(() => recentActivity(activeTabTasks(workspaceTasks), 3), [workspaceTasks])
   const workspaceSessions = useMemo(
     () => sessionsOfWorkspace(snapshot.sessions, workspace?.id ?? null),
     [snapshot.sessions, workspace],
@@ -497,20 +571,7 @@ export function TaskPanel({ sessionsList }: TaskPanelProps): JSX.Element {
     [workspaceTasks, snapshot.sessions],
   )
 
-  const workingCount = workspaceTasks.filter(task => task.status === 'working').length
-  const reviewCount = workspaceTasks.filter(task => task.status === 'completed' && !task.settled).length
-
   useEffect(() => {
-    if (!open) {
-      document.documentElement.removeAttribute('data-agent-bus-panel-open')
-      return
-    }
-    document.documentElement.setAttribute('data-agent-bus-panel-open', '')
-    return () => document.documentElement.removeAttribute('data-agent-bus-panel-open')
-  }, [open])
-
-  useEffect(() => {
-    if (!open) return
     const onKey = (event: KeyboardEvent): void => {
       if (event.key !== 'Escape') return
       if (focusedTaskId !== null) {
@@ -518,23 +579,32 @@ export function TaskPanel({ sessionsList }: TaskPanelProps): JSX.Element {
         setFloatAnchor(null)
         return
       }
-      setOpen(false)
-      setWsMenu(false)
+      if (launcherOpen) {
+        setLauncherOpen(false)
+        setWsMenu(false)
+        return
+      }
+      if (taskNoteOpen && !noteGeom.pinned) {
+        setTaskNoteOpen(false)
+        setWsMenu(false)
+      }
     }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [focusedTaskId, launcherOpen, taskNoteOpen, noteGeom.pinned])
+
+  useEffect(() => {
+    if (!launcherOpen) return
     const onPointer = (event: MouseEvent): void => {
       const target = event.target
       if (!(target instanceof Node)) return
-      if (rootRef.current?.contains(target)) return
-      setOpen(false)
-      setWsMenu(false)
+      if (target instanceof Element && target.closest(`.${css.abPLauncher}`)) return
+      if (target instanceof Element && target.closest(`.${css.abPCapsule}`)) return
+      setLauncherOpen(false)
     }
-    document.addEventListener('keydown', onKey)
     document.addEventListener('mousedown', onPointer)
-    return () => {
-      document.removeEventListener('keydown', onKey)
-      document.removeEventListener('mousedown', onPointer)
-    }
-  }, [open, focusedTaskId])
+    return () => document.removeEventListener('mousedown', onPointer)
+  }, [launcherOpen])
 
   useEffect(() => {
     if (focusedTaskId === null) return
@@ -551,28 +621,82 @@ export function TaskPanel({ sessionsList }: TaskPanelProps): JSX.Element {
   }, [focusedTaskId])
 
   useEffect(() => {
-    if (!open) return
+    if (!taskNoteOpen) return
     const timer = window.setInterval(() => setNowMs(Date.now()), 15_000)
     return () => window.clearInterval(timer)
-  }, [open])
+  }, [taskNoteOpen])
 
-  const clearPreviewTimers = (): void => {
-    window.clearTimeout(showTimer.current)
-    window.clearTimeout(hideTimer.current)
+  const persistNote = (next: NoteGeom): void => {
+    const clamped = clampNoteGeom(next)
+    noteGeomRef.current = clamped
+    setNoteGeom(clamped)
+    writeNoteGeom(clamped)
   }
 
-  const armPreview = (): void => {
-    if (open) return
-    clearPreviewTimers()
-    showTimer.current = window.setTimeout(() => setPreview(true), PREVIEW_SHOW_MS)
+  const onNoteDragDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    if (event.button !== 0) return
+    if (event.target instanceof Element && event.target.closest('button')) return
+    event.preventDefault()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    noteDrag.current = {
+      originX: event.clientX,
+      originY: event.clientY,
+      startX: noteGeomRef.current.x,
+      startY: noteGeomRef.current.y,
+    }
   }
 
-  const disarmPreview = (): void => {
-    clearPreviewTimers()
-    hideTimer.current = window.setTimeout(() => setPreview(false), PREVIEW_HIDE_MS)
+  const onNoteDragMove = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    const drag = noteDrag.current
+    if (drag === null) return
+    persistNote({
+      ...noteGeomRef.current,
+      x: drag.startX + event.clientX - drag.originX,
+      y: drag.startY + event.clientY - drag.originY,
+    })
   }
 
-  useEffect(() => () => clearPreviewTimers(), [])
+  const onNoteDragUp = (): void => {
+    noteDrag.current = null
+  }
+
+  const onNoteResizeDown = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    event.preventDefault()
+    event.stopPropagation()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    noteResize.current = {
+      originX: event.clientX,
+      originY: event.clientY,
+      startW: noteGeomRef.current.w,
+      startH: noteGeomRef.current.h,
+    }
+  }
+
+  const onNoteResizeMove = (event: ReactPointerEvent<HTMLDivElement>): void => {
+    const drag = noteResize.current
+    if (drag === null) return
+    persistNote({
+      ...noteGeomRef.current,
+      w: drag.startW + event.clientX - drag.originX,
+      h: drag.startH + event.clientY - drag.originY,
+    })
+  }
+
+  const onNoteResizeUp = (): void => {
+    noteResize.current = null
+  }
+
+  const openTaskNote = (): void => {
+    setTaskNoteOpen(true)
+    setLauncherOpen(false)
+  }
+
+  const closeTaskNote = (): void => {
+    setTaskNoteOpen(false)
+    setWsMenu(false)
+    setFocusedTaskId(null)
+    setFloatAnchor(null)
+  }
 
   const selectWorkspace = (id: string): void => {
     setStoredWorkspace(id)
@@ -631,12 +755,6 @@ export function TaskPanel({ sessionsList }: TaskPanelProps): JSX.Element {
     setArchiveOpen(true)
   }
 
-  const openDrawer = (): void => {
-    clearPreviewTimers()
-    setPreview(false)
-    setOpen(true)
-  }
-
   const wsTitle = workspace?.title ?? '未选择工作区'
   const emptyLabel = archiveMode
     ? (sessionFilter === null ? '暂无归档任务' : '该会话暂无归档任务')
@@ -651,13 +769,10 @@ export function TaskPanel({ sessionsList }: TaskPanelProps): JSX.Element {
         type="button"
         className={css.abPCapsule}
         data-loading={loading || undefined}
-        aria-expanded={open}
-        aria-label={`任务面板，${activeCount} 个活跃任务`}
-        onClick={openDrawer}
-        onMouseEnter={armPreview}
-        onMouseLeave={disarmPreview}
-        onFocus={armPreview}
-        onBlur={disarmPreview}
+        data-open={launcherOpen || undefined}
+        aria-expanded={launcherOpen}
+        aria-label={`工作台，${activeCount} 个活跃任务`}
+        onClick={() => setLauncherOpen(value => !value)}
       >
         {activeCount === 0
           ? <span className={css.abPCapsuleDot} />
@@ -665,35 +780,60 @@ export function TaskPanel({ sessionsList }: TaskPanelProps): JSX.Element {
         <span className={css.abPCapsuleMeta}>{snapshot.workspaces.length} ws</span>
       </button>
 
-      {preview && !open && (
-        <div className={css.abPPreview} role="status">
-          <div className={css.abPPreviewHead}>
-            <div className={css.abPPreviewWs}>{wsTitle}</div>
-            <div className={css.abPPreviewStats}>
-              {`进行中 ${workingCount} · 待验收 ${reviewCount}`}
-            </div>
-          </div>
-          {previewRows.length === 0
-            ? <div className={css.abPPreviewEmpty}>暂无进行中的任务</div>
-            : (
-              <div className={css.abPPreviewList}>
-                {previewRows.map(task => (
-                  <div key={task.id} className={css.abPPreviewRow}>
-                    <StatusDot task={task} className={css.abPDot} />
-                    <div>
-                      <div className={css.abPPreviewTo}>{task.toTitle ?? '—'}</div>
-                      <div className={css.abPPreviewText}>
-                        {truncateCodePoints(task.contentPreview, 60)}
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
+      {launcherOpen && (
+        <div className={css.abPLauncher} role="menu" aria-label="工作台">
+          {LAUNCHER_TILES.map(tile => (
+            <button
+              key={tile.id}
+              type="button"
+              className={css.abPLaunchTile}
+              role="menuitem"
+              disabled={!tile.ready}
+              data-active={tile.id === 'tasks' && taskNoteOpen || undefined}
+              onClick={() => { if (tile.id === 'tasks') openTaskNote() }}
+            >
+              <span className={css.abPLaunchMark}>{tile.ready ? '任' : '+'}</span>
+              {tile.label}
+            </button>
+          ))}
         </div>
       )}
 
-      <aside className={css.abPDrawer} data-open={open || undefined} aria-hidden={!open}>
+      {taskNoteOpen && (
+        <div
+          className={css.abPNote}
+          data-pinned={noteGeom.pinned || undefined}
+          style={{ left: noteGeom.x, top: noteGeom.y, width: noteGeom.w, height: noteGeom.h }}
+        >
+          <div
+            className={css.abPNoteBar}
+            onPointerDown={onNoteDragDown}
+            onPointerMove={onNoteDragMove}
+            onPointerUp={onNoteDragUp}
+            onPointerCancel={onNoteDragUp}
+          >
+            <span className={css.abPNoteTitle}>任务</span>
+            <button
+              type="button"
+              className={`${css.abPClose} ${css.abPNotePin}`}
+              data-on={noteGeom.pinned || undefined}
+              aria-pressed={noteGeom.pinned}
+              aria-label={noteGeom.pinned ? '取消钉选' : '钉选窗口'}
+              onClick={() => persistNote({ ...noteGeomRef.current, pinned: !noteGeomRef.current.pinned })}
+            >
+              钉
+            </button>
+            <button
+              type="button"
+              className={css.abPClose}
+              aria-label="关闭任务窗口"
+              onClick={closeTaskNote}
+            >
+              <IconCloseOutline16 size={16} />
+            </button>
+          </div>
+          <div className={css.abPNoteBody}>
+      <aside className={css.abPDrawer}>
         <div className={css.abPTop}>
           <div className={css.abPWs}>
             <button
@@ -727,14 +867,6 @@ export function TaskPanel({ sessionsList }: TaskPanelProps): JSX.Element {
               </div>
             )}
           </div>
-          <button
-            type="button"
-            className={css.abPClose}
-            aria-label="关闭任务面板"
-            onClick={() => { setOpen(false); setWsMenu(false) }}
-          >
-            <IconCloseOutline16 size={16} />
-          </button>
         </div>
         <div className={css.abPBody}>
           <nav
@@ -894,6 +1026,17 @@ export function TaskPanel({ sessionsList }: TaskPanelProps): JSX.Element {
           </div>
         </div>
       </aside>
+          </div>
+          <div
+            className={css.abPNoteGrip}
+            aria-label="缩放窗口"
+            onPointerDown={onNoteResizeDown}
+            onPointerMove={onNoteResizeMove}
+            onPointerUp={onNoteResizeUp}
+            onPointerCancel={onNoteResizeUp}
+          />
+        </div>
+      )}
       {focusedTask !== null && floatAnchor !== null && (
         <TaskFloat
           task={focusedTask}
@@ -908,4 +1051,4 @@ export function TaskPanel({ sessionsList }: TaskPanelProps): JSX.Element {
 }
 
 /** Fallback sheet used when the CSS-module import is not a raw stylesheet. */
-const PANEL_CSS = "/* v1.1 task panel. Class prefix abP* stays clear of the host. Colors are\n   --dsw-alias-* tokens only; motion stays ≤150ms. */\n\n@media (min-width: 900px) {\n  html[data-agent-bus-panel-open] body {\n    padding-right: 440px;\n    box-sizing: border-box;\n  }\n}\n\n.abPRoot {\n  position: contents;\n  font-family: var(--dsw-font-family);\n  color: var(--dsw-alias-label-primary);\n  line-height: 1.45;\n}\n\n.abPCapsule {\n  position: fixed;\n  top: 50%;\n  right: 0;\n  z-index: 40;\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 6px;\n  width: 48px;\n  min-height: 84px;\n  padding: 14px 6px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-right: none;\n  border-radius: 12px 0 0 12px;\n  background: color-mix(in srgb, var(--dsw-alias-bg-layer-1) 90%, transparent);\n  color: var(--dsw-alias-label-primary);\n  box-shadow: -6px 0 20px var(--dsw-alias-bg-mask-2);\n  backdrop-filter: blur(12px);\n  cursor: pointer;\n  transform: translateY(-50%);\n  transition: transform 150ms var(--ds-ease-in-out, ease);\n}\n\n.abPCapsule:focus-visible {\n  outline: 2px solid var(--dsw-alias-state-business-primary);\n  outline-offset: 2px;\n}\n\nhtml[data-agent-bus-panel-open] .abPCapsule {\n  transform: translate(100%, -50%);\n  pointer-events: none;\n}\n\n.abPCapsuleCount {\n  font-size: 22px;\n  font-weight: 600;\n  line-height: 28px;\n  font-variant-numeric: tabular-nums;\n  letter-spacing: -0.03em;\n}\n\n.abPCapsuleMeta {\n  font-size: 11px;\n  line-height: 14px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPCapsuleDot {\n  width: 8px;\n  height: 8px;\n  border-radius: 50%;\n  background: var(--dsw-alias-label-tertiary);\n  opacity: 0.65;\n}\n\n.abPCapsule[data-loading] .abPCapsuleDot,\n.abPCapsule[data-loading] .abPCapsuleCount {\n  animation: abPPulse 1.2s var(--ds-ease-in-out, ease) infinite;\n}\n\n.abPPreview {\n  position: fixed;\n  top: 50%;\n  right: 58px;\n  z-index: 41;\n  width: 280px;\n  padding: 14px 16px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 12px;\n  background: color-mix(in srgb, var(--dsw-alias-bg-layer-1) 94%, transparent);\n  box-shadow: -8px 6px 24px var(--dsw-alias-bg-mask-2);\n  backdrop-filter: blur(12px);\n  transform: translateY(-50%);\n  pointer-events: none;\n}\n\nhtml[data-agent-bus-panel-open] .abPPreview {\n  display: none;\n}\n\n.abPPreviewHead {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  margin-bottom: 12px;\n  padding-bottom: 10px;\n  border-bottom: 1px solid var(--dsw-alias-border-l1);\n}\n\n.abPPreviewWs {\n  font-size: 13px;\n  font-weight: 600;\n  line-height: 20px;\n  color: var(--dsw-alias-label-primary);\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.abPPreviewStats {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n}\n\n.abPPreviewList {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\n\n.abPPreviewRow {\n  display: grid;\n  grid-template-columns: 8px minmax(0, 1fr);\n  gap: 10px;\n  align-items: start;\n}\n\n.abPPreviewTo {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n}\n\n.abPPreviewText {\n  font-size: 13px;\n  line-height: 20px;\n  color: var(--dsw-alias-label-primary);\n  overflow: hidden;\n  display: -webkit-box;\n  -webkit-line-clamp: 2;\n  -webkit-box-orient: vertical;\n}\n\n.abPPreviewEmpty {\n  font-size: 13px;\n  line-height: 20px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPDrawer {\n  position: fixed;\n  top: 0;\n  right: 0;\n  z-index: 42;\n  display: flex;\n  flex-direction: column;\n  width: 440px;\n  height: 100vh;\n  border-left: 1px solid var(--dsw-alias-border-l2);\n  background: var(--dsw-alias-bg-layer-1);\n  box-shadow: -12px 0 32px var(--dsw-alias-bg-mask-2);\n  transform: translateX(100%);\n  transition: transform 150ms var(--ds-ease-in-out, ease);\n  pointer-events: none;\n  --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-bg-l2);\n  --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-hover-l2);\n}\n\n.abPDrawer[data-open] {\n  transform: translateX(0);\n  pointer-events: auto;\n}\n\n.abPTop {\n  display: flex;\n  align-items: center;\n  gap: 10px;\n  flex: none;\n  min-height: 56px;\n  padding: 10px 12px 10px 14px;\n  border-bottom: 1px solid var(--dsw-alias-border-l2);\n  background: var(--dsw-alias-bg-layer-1);\n}\n\n.abPWs {\n  position: relative;\n  min-width: 0;\n  flex: 1;\n}\n\n.abPWsBtn {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  width: 100%;\n  min-height: 36px;\n  padding: 6px 10px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 10px;\n  background: var(--dsw-alias-bg-layer-2);\n  color: var(--dsw-alias-label-primary);\n  font: inherit;\n  text-align: left;\n  cursor: pointer;\n}\n\n.abPWsBtn:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.abPWsBtn:focus-visible,\n.abPClose:focus-visible,\n.abPSession:focus-visible,\n.abPTask:focus-visible,\n.abPWsItem:focus-visible,\n.abPAllBtn:focus-visible,\n.abPAllToggle:focus-visible,\n.abPOfflineToggle:focus-visible {\n  outline: 2px solid var(--dsw-alias-state-business-primary);\n  outline-offset: 1px;\n}\n\n.abPWsTitle {\n  min-width: 0;\n  flex: 1;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  font-size: 14px;\n  font-weight: 600;\n  line-height: 22px;\n}\n\n.abPWsChevron {\n  flex: none;\n  display: inline-flex;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPWsMenu {\n  position: absolute;\n  top: calc(100% + 6px);\n  left: 0;\n  right: 0;\n  z-index: 3;\n  max-height: 280px;\n  overflow: auto;\n  padding: 6px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 10px;\n  background: var(--dsw-alias-bg-layer-1);\n  box-shadow: 0 10px 24px var(--dsw-alias-bg-mask-2);\n}\n\n.abPWsItem {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  width: 100%;\n  padding: 8px 10px;\n  border: none;\n  border-radius: 8px;\n  background: transparent;\n  color: inherit;\n  font: inherit;\n  text-align: left;\n  cursor: pointer;\n}\n\n.abPWsItem:hover,\n.abPWsItem[data-active] {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.abPWsItemPath {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-tertiary);\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.abPClose {\n  flex: none;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 32px;\n  height: 32px;\n  padding: 0;\n  border: none;\n  border-radius: 8px;\n  background: transparent;\n  color: var(--dsw-alias-label-secondary);\n  cursor: pointer;\n}\n\n.abPClose:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n  color: var(--dsw-alias-label-primary);\n}\n\n.abPBody {\n  display: flex;\n  min-height: 0;\n  flex: 1;\n}\n\n.abPSessions {\n  position: relative;\n  display: flex;\n  flex-direction: column;\n  flex: none;\n  width: 160px;\n  min-width: 128px;\n  max-width: 280px;\n  padding: 10px 8px;\n  overflow: auto;\n  border-right: 1px solid var(--dsw-alias-border-l2);\n  background: var(--dsw-specific-sidebar-fill, var(--dsw-alias-bg-module-platform));\n}\n\n.abPResize {\n  position: absolute;\n  top: 0;\n  right: -3px;\n  z-index: 3;\n  width: 6px;\n  height: 100%;\n  cursor: col-resize;\n  touch-action: none;\n}\n\n.abPResize:hover,\n.abPResize:active {\n  background: color-mix(in srgb, var(--dsw-alias-state-business-primary) 40%, transparent);\n}\n\n.abPGroup {\n  display: flex;\n  flex-direction: column;\n  margin-top: 10px;\n  padding-top: 10px;\n  border-top: 1px solid var(--dsw-alias-border-l2);\n}\n\n.abPAll {\n  display: flex;\n  align-items: stretch;\n  gap: 2px;\n  margin-bottom: 6px;\n}\n\n.abPAllBtn {\n  display: flex;\n  align-items: center;\n  min-width: 0;\n  flex: 1;\n  min-height: 34px;\n  padding: 6px 8px;\n  border: none;\n  border-radius: 8px;\n  background: transparent;\n  color: var(--dsw-alias-label-primary);\n  font: inherit;\n  font-size: 13px;\n  font-weight: 600;\n  line-height: 20px;\n  text-align: left;\n  cursor: pointer;\n}\n\n.abPAllBtn:hover,\n.abPAllToggle:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.abPAllBtn[data-active],\n.abPSession[data-active] {\n  background: var(--dsw-alias-button-ghost-active-fill);\n}\n\n.abPAllToggle {\n  flex: none;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 28px;\n  border: none;\n  border-radius: 8px;\n  background: transparent;\n  color: var(--dsw-alias-label-tertiary);\n  cursor: pointer;\n}\n\n.abPAllToggle[data-open] {\n  color: var(--dsw-alias-label-secondary);\n}\n\n.abPAllToggle[data-open] svg {\n  transform: rotate(180deg);\n}\n\n.abPAllToggle svg {\n  transition: transform 150ms var(--ds-ease-in-out, ease);\n}\n\n.abPSessionList {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n}\n\n.abPSession {\n  display: flex;\n  align-items: flex-start;\n  gap: 8px;\n  width: 100%;\n  min-height: 34px;\n  padding: 6px 8px;\n  border: none;\n  border-radius: 8px;\n  background: transparent;\n  color: var(--dsw-alias-label-primary);\n  font: inherit;\n  font-size: 13px;\n  line-height: 20px;\n  text-align: left;\n  cursor: pointer;\n}\n\n.abPSession:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.abPSession[data-current] .abPSessionTitle {\n  font-weight: 600;\n}\n\n.abPSessionText {\n  display: flex;\n  flex-direction: column;\n  gap: 1px;\n  min-width: 0;\n  flex: 1;\n}\n\n.abPSessionTitle {\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.abPOffline {\n  font-size: 11px;\n  line-height: 16px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPOfflineToggle {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 6px;\n  width: 100%;\n  min-height: 30px;\n  margin-top: 4px;\n  padding: 4px 8px;\n  border: none;\n  border-radius: 8px;\n  background: transparent;\n  color: var(--dsw-alias-label-tertiary);\n  font: inherit;\n  font-size: 12px;\n  line-height: 18px;\n  text-align: left;\n  cursor: pointer;\n}\n\n.abPOfflineToggle:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n  color: var(--dsw-alias-label-secondary);\n}\n\n.abPOfflineToggle svg {\n  flex: none;\n  transition: transform 150ms var(--ds-ease-in-out, ease);\n}\n\n.abPOfflineToggle[data-open] svg {\n  transform: rotate(180deg);\n}\n\n.abPLive {\n  flex: none;\n  width: 7px;\n  height: 7px;\n  margin-top: 6px;\n  border-radius: 50%;\n  background: var(--dsw-alias-label-tertiary);\n}\n\n.abPLive[data-on] {\n  background: var(--dsw-alias-state-success-primary);\n}\n\n.abPMain {\n  position: relative;\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  min-width: 0;\n  flex: 1;\n  padding: 12px;\n  overflow: auto;\n}\n\n.abPEmpty {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 6px;\n  min-height: 160px;\n  padding: 24px 16px;\n  text-align: center;\n}\n\n.abPEmptyTitle {\n  font-size: 14px;\n  line-height: 22px;\n  color: var(--dsw-alias-label-secondary);\n}\n\n.abPEmptyHint {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPTask {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  width: 100%;\n  padding: 10px 12px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 10px;\n  background: var(--dsw-alias-bg-layer-2);\n  color: inherit;\n  font: inherit;\n  text-align: left;\n  cursor: pointer;\n}\n\n.abPTask:hover,\n.abPTask[data-focused] {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.abPTask[data-focused],\n.abPTask[data-current] {\n  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary) 50%, var(--dsw-alias-border-l2));\n}\n\n.abPTaskSummary {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n  min-width: 0;\n}\n\n.abPTaskLine {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  min-width: 0;\n}\n\n.abPTaskPreview {\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  font-size: 14px;\n  line-height: 22px;\n}\n\n.abPTaskMeta {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-tertiary);\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.abPDot {\n  width: 8px;\n  height: 8px;\n  margin-top: 7px;\n  border-radius: 50%;\n  background: var(--dsw-alias-label-tertiary);\n}\n\n.abPDot[data-tone='business'] { background: var(--dsw-alias-state-business-primary); }\n.abPDot[data-tone='warning'] { background: var(--dsw-alias-state-warn-primary); }\n.abPDot[data-tone='success'] { background: var(--dsw-alias-state-success-primary); }\n.abPDot[data-tone='danger'] { background: var(--dsw-alias-state-error-primary); }\n.abPDot[data-tone='tertiary'] { background: var(--dsw-alias-label-tertiary); }\n\n.abPBadge {\n  flex: none;\n  padding: 0 7px;\n  border: 1px solid transparent;\n  border-radius: 5px;\n  font-size: 12px;\n  line-height: 20px;\n  color: var(--dsw-alias-label-secondary);\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.abPBadge[data-tone='business'] {\n  color: var(--dsw-alias-state-business-primary);\n  background: var(--dsw-alias-state-business-tertiary);\n}\n\n.abPBadge[data-tone='warning'] {\n  color: var(--dsw-alias-state-warn-label);\n  background: var(--dsw-alias-state-warn-tertiary);\n}\n\n.abPBadge[data-tone='success'] {\n  color: var(--dsw-alias-state-success-primary);\n  background: var(--dsw-alias-state-success-tertiary);\n}\n\n.abPBadge[data-tone='danger'] {\n  color: var(--dsw-alias-state-error-primary);\n  background: var(--dsw-alias-interactive-bg-hover-danger);\n}\n\n.abPBadge[data-kind='dashed'] {\n  border-color: var(--dsw-alias-state-warn-primary);\n  border-style: dashed;\n  background: transparent;\n}\n\n.abPBadge[data-kind='outline'] {\n  border-color: var(--dsw-alias-border-l3);\n  background: transparent;\n}\n\n.abPFloat {\n  position: fixed;\n  z-index: 50;\n  box-sizing: border-box;\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n  max-height: min(72vh, 560px);\n  overflow: auto;\n  padding: 14px 16px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 14px;\n  background: color-mix(in srgb, var(--dsw-alias-bg-layer-1) 92%, transparent);\n  box-shadow: 0 18px 40px var(--dsw-alias-bg-mask-2);\n  backdrop-filter: blur(14px);\n  pointer-events: auto;\n}\n\n.abPFloatTop {\n  display: grid;\n  grid-template-columns: 8px minmax(0, 1fr) auto;\n  gap: 10px;\n  align-items: start;\n}\n\n.abPFloatTitle {\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  font-size: 14px;\n  line-height: 22px;\n}\n\n.abPChainArrow {\n  margin: 0 6px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPCalls {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\n\n.abPCall {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n  padding: 10px 12px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 10px;\n  background: var(--dsw-alias-bg-layer-2);\n}\n\n.abPCallHead {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: baseline;\n  gap: 2px 0;\n}\n\n.abPCallWho {\n  font-size: 14px;\n  font-weight: 600;\n  line-height: 22px;\n  color: var(--dsw-alias-label-primary);\n}\n\n.abPCallRoles {\n  margin-left: 8px;\n  font-size: 11px;\n  line-height: 16px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPCallSummary {\n  font-size: 13px;\n  line-height: 20px;\n  color: var(--dsw-alias-label-secondary);\n  overflow-wrap: anywhere;\n}\n\n.abPCallCost {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n}\n\n.abPCallCostName {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-primary);\n}\n\n.abPNote {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  padding: 10px 12px;\n  border-radius: 8px;\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.abPNoteLabel {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPNoteText {\n  font-size: 13px;\n  line-height: 20px;\n  color: var(--dsw-alias-label-primary);\n  overflow-wrap: anywhere;\n}\n\n.abPContent {\n  max-height: 240px;\n  margin: 0;\n  padding: 10px 12px;\n  overflow: auto;\n  border-radius: 8px;\n  background: var(--dsw-alias-markdown-code-block);\n  color: var(--dsw-alias-label-secondary);\n  font-family: var(--ds-font-family-code);\n  font-size: 12px;\n  line-height: 20px;\n  white-space: pre-wrap;\n  word-break: break-word;\n}\n\n.abPZone {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPZone[data-missing] {\n  color: var(--dsw-alias-state-error-primary);\n}\n\n.abPStaff {\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  padding-top: 8px;\n  border-top: 1px solid var(--dsw-alias-border-l1);\n}\n\n.abPStaffHead {\n  font-size: 13px;\n  font-weight: 600;\n  line-height: 20px;\n  color: var(--dsw-alias-label-secondary);\n}\n\n.abPStaffRow {\n  display: grid;\n  grid-template-columns: 2em minmax(3em, 1fr);\n  gap: 4px 10px;\n  align-items: baseline;\n  padding: 8px 0 0;\n  border-top: 1px solid var(--dsw-alias-border-l1);\n  font-size: 13px;\n  line-height: 20px;\n}\n\n.abPRole {\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPStaffTitle {\n  min-width: 2em;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  color: var(--dsw-alias-label-primary);\n}\n\n.abPTriple {\n  grid-column: 1 / -1;\n  display: flex;\n  flex-wrap: wrap;\n  gap: 6px 14px;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n  font-variant-numeric: tabular-nums;\n}\n\n@keyframes abPPulse {\n  50% { opacity: 0.4; }\n}\n\n@media (prefers-reduced-motion: reduce) {\n  .abPCapsule,\n  .abPDrawer,\n  .abPAllToggle svg,\n  .abPOfflineToggle svg,\n  .abPCapsule[data-loading] .abPCapsuleDot,\n  .abPCapsule[data-loading] .abPCapsuleCount {\n    transition: none;\n    animation: none;\n  }\n}\n"
+const PANEL_CSS = "/* v1.1 task panel. Class prefix abP* stays clear of the host. Colors are\n   --dsw-alias-* tokens only; motion stays ≤150ms. */\n\n\n\n.abPRoot {\n  position: contents;\n  font-family: var(--dsw-font-family);\n  color: var(--dsw-alias-label-primary);\n  line-height: 1.45;\n}\n\n.abPCapsule {\n  position: fixed;\n  top: 50%;\n  right: 0;\n  z-index: 40;\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 6px;\n  width: 48px;\n  min-height: 84px;\n  padding: 14px 6px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-right: none;\n  border-radius: 12px 0 0 12px;\n  background: color-mix(in srgb, var(--dsw-alias-bg-layer-1) 90%, transparent);\n  color: var(--dsw-alias-label-primary);\n  box-shadow: -6px 0 20px var(--dsw-alias-bg-mask-2);\n  backdrop-filter: blur(12px);\n  cursor: pointer;\n  transform: translateY(-50%);\n  transition: transform 150ms var(--ds-ease-in-out, ease);\n}\n\n.abPCapsule:focus-visible {\n  outline: 2px solid var(--dsw-alias-state-business-primary);\n  outline-offset: 2px;\n}\n\n.abPCapsule[data-open] {\n  border-color: var(--dsw-alias-state-business-primary);\n}\n\n.abPCapsuleCount {\n  font-size: 22px;\n  font-weight: 600;\n  line-height: 28px;\n  font-variant-numeric: tabular-nums;\n  letter-spacing: -0.03em;\n}\n\n.abPCapsuleMeta {\n  font-size: 11px;\n  line-height: 14px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPCapsuleDot {\n  width: 8px;\n  height: 8px;\n  border-radius: 50%;\n  background: var(--dsw-alias-label-tertiary);\n  opacity: 0.65;\n}\n\n.abPCapsule[data-loading] .abPCapsuleDot,\n.abPCapsule[data-loading] .abPCapsuleCount {\n  animation: abPPulse 1.2s var(--ds-ease-in-out, ease) infinite;\n}\n\n.abPPreview {\n  position: fixed;\n  top: 50%;\n  right: 58px;\n  z-index: 41;\n  width: 280px;\n  padding: 14px 16px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 12px;\n  background: color-mix(in srgb, var(--dsw-alias-bg-layer-1) 94%, transparent);\n  box-shadow: -8px 6px 24px var(--dsw-alias-bg-mask-2);\n  backdrop-filter: blur(12px);\n  transform: translateY(-50%);\n  pointer-events: none;\n}\n\nhtml[data-agent-bus-panel-open] .abPPreview {\n  display: none;\n}\n\n.abPPreviewHead {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  margin-bottom: 12px;\n  padding-bottom: 10px;\n  border-bottom: 1px solid var(--dsw-alias-border-l1);\n}\n\n.abPPreviewWs {\n  font-size: 13px;\n  font-weight: 600;\n  line-height: 20px;\n  color: var(--dsw-alias-label-primary);\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.abPPreviewStats {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n}\n\n.abPPreviewList {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\n\n.abPPreviewRow {\n  display: grid;\n  grid-template-columns: 8px minmax(0, 1fr);\n  gap: 10px;\n  align-items: start;\n}\n\n.abPPreviewTo {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n}\n\n.abPPreviewText {\n  font-size: 13px;\n  line-height: 20px;\n  color: var(--dsw-alias-label-primary);\n  overflow: hidden;\n  display: -webkit-box;\n  -webkit-line-clamp: 2;\n  -webkit-box-orient: vertical;\n}\n\n.abPPreviewEmpty {\n  font-size: 13px;\n  line-height: 20px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPLauncher {\n  position: fixed;\n  right: 60px;\n  top: 50%;\n  z-index: 45;\n  display: grid;\n  grid-template-columns: repeat(3, 1fr);\n  gap: 8px;\n  width: 228px;\n  padding: 12px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 16px;\n  background: color-mix(in srgb, var(--dsw-alias-bg-layer-1) 92%, transparent);\n  box-shadow: -8px 8px 28px var(--dsw-alias-bg-mask-2);\n  backdrop-filter: blur(14px);\n  transform: translateY(-50%);\n}\n\n.abPLaunchTile {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 4px;\n  aspect-ratio: 1;\n  padding: 6px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 12px;\n  background: var(--dsw-alias-bg-layer-2);\n  color: var(--dsw-alias-label-primary);\n  font: inherit;\n  font-size: 12px;\n  line-height: 16px;\n  cursor: pointer;\n}\n\n.abPLaunchTile:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.abPLaunchTile[data-active] {\n  border-color: var(--dsw-alias-state-business-primary);\n}\n\n.abPLaunchTile:disabled {\n  opacity: 0.38;\n  cursor: default;\n}\n\n.abPLaunchMark {\n  font-size: 16px;\n  font-weight: 600;\n  line-height: 22px;\n  color: var(--dsw-alias-state-business-primary);\n}\n\n.abPNote {\n  position: fixed;\n  z-index: 48;\n  box-sizing: border-box;\n  display: flex;\n  flex-direction: column;\n  min-width: 360px;\n  min-height: 320px;\n  overflow: hidden;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 12px;\n  background: color-mix(in srgb, var(--dsw-alias-bg-layer-1) 94%, transparent);\n  box-shadow: 0 16px 40px var(--dsw-alias-bg-mask-2);\n  backdrop-filter: blur(12px);\n  --dsh-scrollbar-thumb: var(--dsw-alias-scrollbar-bg-l2);\n  --dsh-scrollbar-thumb-hover: var(--dsw-alias-scrollbar-hover-l2);\n}\n\n.abPNote[data-pinned] {\n  z-index: 49;\n  box-shadow: 0 18px 44px var(--dsw-alias-bg-mask-1);\n}\n\n.abPNoteBar {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  flex: none;\n  min-height: 36px;\n  padding: 4px 8px 4px 12px;\n  border-bottom: 1px solid var(--dsw-alias-border-l2);\n  cursor: grab;\n  user-select: none;\n  touch-action: none;\n}\n\n.abPNoteBar:active {\n  cursor: grabbing;\n}\n\n.abPNoteTitle {\n  min-width: 0;\n  flex: 1;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  font-size: 13px;\n  font-weight: 600;\n  line-height: 20px;\n}\n\n.abPNotePin[data-on] {\n  color: var(--dsw-alias-state-business-primary);\n}\n\n.abPNoteBody {\n  display: flex;\n  flex-direction: column;\n  min-height: 0;\n  flex: 1;\n}\n\n.abPNoteGrip {\n  position: absolute;\n  right: 2px;\n  bottom: 2px;\n  width: 14px;\n  height: 14px;\n  cursor: nwse-resize;\n  touch-action: none;\n  background:\n    linear-gradient(\n      135deg,\n      transparent 50%,\n      var(--dsw-alias-label-tertiary) 50%,\n      var(--dsw-alias-label-tertiary) 60%,\n      transparent 60%,\n      transparent 75%,\n      var(--dsw-alias-label-tertiary) 75%\n    );\n}\n\n.abPDrawer {\n  display: flex;\n  flex-direction: column;\n  min-height: 0;\n  flex: 1;\n}\n\n.abPTop {\n  display: flex;\n  align-items: center;\n  gap: 10px;\n  flex: none;\n  min-height: 56px;\n  padding: 10px 12px 10px 14px;\n  border-bottom: 1px solid var(--dsw-alias-border-l2);\n  background: var(--dsw-alias-bg-layer-1);\n}\n\n.abPWs {\n  position: relative;\n  min-width: 0;\n  flex: 1;\n}\n\n.abPWsBtn {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  width: 100%;\n  min-height: 36px;\n  padding: 6px 10px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 10px;\n  background: var(--dsw-alias-bg-layer-2);\n  color: var(--dsw-alias-label-primary);\n  font: inherit;\n  text-align: left;\n  cursor: pointer;\n}\n\n.abPWsBtn:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.abPWsBtn:focus-visible,\n.abPClose:focus-visible,\n.abPSession:focus-visible,\n.abPTask:focus-visible,\n.abPWsItem:focus-visible,\n.abPAllBtn:focus-visible,\n.abPAllToggle:focus-visible,\n.abPOfflineToggle:focus-visible {\n  outline: 2px solid var(--dsw-alias-state-business-primary);\n  outline-offset: 1px;\n}\n\n.abPWsTitle {\n  min-width: 0;\n  flex: 1;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  font-size: 14px;\n  font-weight: 600;\n  line-height: 22px;\n}\n\n.abPWsChevron {\n  flex: none;\n  display: inline-flex;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPWsMenu {\n  position: absolute;\n  top: calc(100% + 6px);\n  left: 0;\n  right: 0;\n  z-index: 3;\n  max-height: 280px;\n  overflow: auto;\n  padding: 6px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 10px;\n  background: var(--dsw-alias-bg-layer-1);\n  box-shadow: 0 10px 24px var(--dsw-alias-bg-mask-2);\n}\n\n.abPWsItem {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n  width: 100%;\n  padding: 8px 10px;\n  border: none;\n  border-radius: 8px;\n  background: transparent;\n  color: inherit;\n  font: inherit;\n  text-align: left;\n  cursor: pointer;\n}\n\n.abPWsItem:hover,\n.abPWsItem[data-active] {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.abPWsItemPath {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-tertiary);\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.abPClose {\n  flex: none;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 32px;\n  height: 32px;\n  padding: 0;\n  border: none;\n  border-radius: 8px;\n  background: transparent;\n  color: var(--dsw-alias-label-secondary);\n  cursor: pointer;\n}\n\n.abPClose:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n  color: var(--dsw-alias-label-primary);\n}\n\n.abPBody {\n  display: flex;\n  min-height: 0;\n  flex: 1;\n}\n\n.abPSessions {\n  position: relative;\n  display: flex;\n  flex-direction: column;\n  flex: none;\n  width: 160px;\n  min-width: 128px;\n  max-width: 280px;\n  padding: 10px 8px;\n  overflow: auto;\n  border-right: 1px solid var(--dsw-alias-border-l2);\n  background: var(--dsw-specific-sidebar-fill, var(--dsw-alias-bg-module-platform));\n}\n\n.abPResize {\n  position: absolute;\n  top: 0;\n  right: -3px;\n  z-index: 3;\n  width: 6px;\n  height: 100%;\n  cursor: col-resize;\n  touch-action: none;\n}\n\n.abPResize:hover,\n.abPResize:active {\n  background: color-mix(in srgb, var(--dsw-alias-state-business-primary) 40%, transparent);\n}\n\n.abPGroup {\n  display: flex;\n  flex-direction: column;\n  margin-top: 10px;\n  padding-top: 10px;\n  border-top: 1px solid var(--dsw-alias-border-l2);\n}\n\n.abPAll {\n  display: flex;\n  align-items: stretch;\n  gap: 2px;\n  margin-bottom: 6px;\n}\n\n.abPAllBtn {\n  display: flex;\n  align-items: center;\n  min-width: 0;\n  flex: 1;\n  min-height: 34px;\n  padding: 6px 8px;\n  border: none;\n  border-radius: 8px;\n  background: transparent;\n  color: var(--dsw-alias-label-primary);\n  font: inherit;\n  font-size: 13px;\n  font-weight: 600;\n  line-height: 20px;\n  text-align: left;\n  cursor: pointer;\n}\n\n.abPAllBtn:hover,\n.abPAllToggle:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.abPAllBtn[data-active],\n.abPSession[data-active] {\n  background: var(--dsw-alias-button-ghost-active-fill);\n}\n\n.abPAllToggle {\n  flex: none;\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  width: 28px;\n  border: none;\n  border-radius: 8px;\n  background: transparent;\n  color: var(--dsw-alias-label-tertiary);\n  cursor: pointer;\n}\n\n.abPAllToggle[data-open] {\n  color: var(--dsw-alias-label-secondary);\n}\n\n.abPAllToggle[data-open] svg {\n  transform: rotate(180deg);\n}\n\n.abPAllToggle svg {\n  transition: transform 150ms var(--ds-ease-in-out, ease);\n}\n\n.abPSessionList {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n}\n\n.abPSession {\n  display: flex;\n  align-items: flex-start;\n  gap: 8px;\n  width: 100%;\n  min-height: 34px;\n  padding: 6px 8px;\n  border: none;\n  border-radius: 8px;\n  background: transparent;\n  color: var(--dsw-alias-label-primary);\n  font: inherit;\n  font-size: 13px;\n  line-height: 20px;\n  text-align: left;\n  cursor: pointer;\n}\n\n.abPSession:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.abPSession[data-current] .abPSessionTitle {\n  font-weight: 600;\n}\n\n.abPSessionText {\n  display: flex;\n  flex-direction: column;\n  gap: 1px;\n  min-width: 0;\n  flex: 1;\n}\n\n.abPSessionTitle {\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.abPOffline {\n  font-size: 11px;\n  line-height: 16px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPOfflineToggle {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 6px;\n  width: 100%;\n  min-height: 30px;\n  margin-top: 4px;\n  padding: 4px 8px;\n  border: none;\n  border-radius: 8px;\n  background: transparent;\n  color: var(--dsw-alias-label-tertiary);\n  font: inherit;\n  font-size: 12px;\n  line-height: 18px;\n  text-align: left;\n  cursor: pointer;\n}\n\n.abPOfflineToggle:hover {\n  background: var(--dsw-alias-interactive-bg-hover);\n  color: var(--dsw-alias-label-secondary);\n}\n\n.abPOfflineToggle svg {\n  flex: none;\n  transition: transform 150ms var(--ds-ease-in-out, ease);\n}\n\n.abPOfflineToggle[data-open] svg {\n  transform: rotate(180deg);\n}\n\n.abPLive {\n  flex: none;\n  width: 7px;\n  height: 7px;\n  margin-top: 6px;\n  border-radius: 50%;\n  background: var(--dsw-alias-label-tertiary);\n}\n\n.abPLive[data-on] {\n  background: var(--dsw-alias-state-success-primary);\n}\n\n.abPMain {\n  position: relative;\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  min-width: 0;\n  flex: 1;\n  padding: 12px;\n  overflow: auto;\n}\n\n.abPEmpty {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  gap: 6px;\n  min-height: 160px;\n  padding: 24px 16px;\n  text-align: center;\n}\n\n.abPEmptyTitle {\n  font-size: 14px;\n  line-height: 22px;\n  color: var(--dsw-alias-label-secondary);\n}\n\n.abPEmptyHint {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPTask {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  width: 100%;\n  padding: 10px 12px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 10px;\n  background: var(--dsw-alias-bg-layer-2);\n  color: inherit;\n  font: inherit;\n  text-align: left;\n  cursor: pointer;\n}\n\n.abPTask:hover,\n.abPTask[data-focused] {\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.abPTask[data-focused],\n.abPTask[data-current] {\n  border-color: color-mix(in srgb, var(--dsw-alias-state-business-primary) 50%, var(--dsw-alias-border-l2));\n}\n\n.abPTaskSummary {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n  min-width: 0;\n}\n\n.abPTaskLine {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  min-width: 0;\n}\n\n.abPTaskPreview {\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  font-size: 14px;\n  line-height: 22px;\n}\n\n.abPTaskMeta {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-tertiary);\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.abPDot {\n  width: 8px;\n  height: 8px;\n  margin-top: 7px;\n  border-radius: 50%;\n  background: var(--dsw-alias-label-tertiary);\n}\n\n.abPDot[data-tone='business'] { background: var(--dsw-alias-state-business-primary); }\n.abPDot[data-tone='warning'] { background: var(--dsw-alias-state-warn-primary); }\n.abPDot[data-tone='success'] { background: var(--dsw-alias-state-success-primary); }\n.abPDot[data-tone='danger'] { background: var(--dsw-alias-state-error-primary); }\n.abPDot[data-tone='tertiary'] { background: var(--dsw-alias-label-tertiary); }\n\n.abPBadge {\n  flex: none;\n  padding: 0 7px;\n  border: 1px solid transparent;\n  border-radius: 5px;\n  font-size: 12px;\n  line-height: 20px;\n  color: var(--dsw-alias-label-secondary);\n  background: var(--dsw-alias-interactive-bg-hover);\n}\n\n.abPBadge[data-tone='business'] {\n  color: var(--dsw-alias-state-business-primary);\n  background: var(--dsw-alias-state-business-tertiary);\n}\n\n.abPBadge[data-tone='warning'] {\n  color: var(--dsw-alias-state-warn-label);\n  background: var(--dsw-alias-state-warn-tertiary);\n}\n\n.abPBadge[data-tone='success'] {\n  color: var(--dsw-alias-state-success-primary);\n  background: var(--dsw-alias-state-success-tertiary);\n}\n\n.abPBadge[data-tone='danger'] {\n  color: var(--dsw-alias-state-error-primary);\n  background: var(--dsw-alias-interactive-bg-hover-danger);\n}\n\n.abPBadge[data-kind='dashed'] {\n  border-color: var(--dsw-alias-state-warn-primary);\n  border-style: dashed;\n  background: transparent;\n}\n\n.abPBadge[data-kind='outline'] {\n  border-color: var(--dsw-alias-border-l3);\n  background: transparent;\n}\n\n.abPFloat {\n  position: fixed;\n  z-index: 50;\n  box-sizing: border-box;\n  display: flex;\n  flex-direction: column;\n  gap: 12px;\n  max-height: min(72vh, 560px);\n  overflow: auto;\n  padding: 14px 16px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 14px;\n  background: color-mix(in srgb, var(--dsw-alias-bg-layer-1) 92%, transparent);\n  box-shadow: 0 18px 40px var(--dsw-alias-bg-mask-2);\n  backdrop-filter: blur(14px);\n  pointer-events: auto;\n}\n\n.abPFloatTop {\n  display: grid;\n  grid-template-columns: 8px minmax(0, 1fr) auto;\n  gap: 10px;\n  align-items: start;\n}\n\n.abPFloatTitle {\n  min-width: 0;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  font-size: 14px;\n  line-height: 22px;\n}\n\n.abPChainArrow {\n  margin: 0 6px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPCalls {\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\n\n.abPCall {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n  padding: 10px 12px;\n  border: 1px solid var(--dsw-alias-border-l2);\n  border-radius: 10px;\n  background: var(--dsw-alias-bg-layer-2);\n}\n\n.abPCallHead {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: baseline;\n  gap: 2px 0;\n}\n\n.abPCallWho {\n  font-size: 14px;\n  font-weight: 600;\n  line-height: 22px;\n  color: var(--dsw-alias-label-primary);\n}\n\n.abPCallRoles {\n  margin-left: 8px;\n  font-size: 11px;\n  line-height: 16px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPCallSummary {\n  font-size: 13px;\n  line-height: 20px;\n  color: var(--dsw-alias-label-secondary);\n  overflow-wrap: anywhere;\n}\n\n.abPCallCost {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n}\n\n.abPCallCostName {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-primary);\n}\n\n.abPContent {\n  max-height: 240px;\n  margin: 0;\n  padding: 10px 12px;\n  overflow: auto;\n  border-radius: 8px;\n  background: var(--dsw-alias-markdown-code-block);\n  color: var(--dsw-alias-label-secondary);\n  font-family: var(--ds-font-family-code);\n  font-size: 12px;\n  line-height: 20px;\n  white-space: pre-wrap;\n  word-break: break-word;\n}\n\n.abPZone {\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPZone[data-missing] {\n  color: var(--dsw-alias-state-error-primary);\n}\n\n.abPStaff {\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  padding-top: 8px;\n  border-top: 1px solid var(--dsw-alias-border-l1);\n}\n\n.abPStaffHead {\n  font-size: 13px;\n  font-weight: 600;\n  line-height: 20px;\n  color: var(--dsw-alias-label-secondary);\n}\n\n.abPStaffRow {\n  display: grid;\n  grid-template-columns: 2em minmax(3em, 1fr);\n  gap: 4px 10px;\n  align-items: baseline;\n  padding: 8px 0 0;\n  border-top: 1px solid var(--dsw-alias-border-l1);\n  font-size: 13px;\n  line-height: 20px;\n}\n\n.abPRole {\n  color: var(--dsw-alias-label-tertiary);\n}\n\n.abPStaffTitle {\n  min-width: 2em;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n  color: var(--dsw-alias-label-primary);\n}\n\n.abPTriple {\n  grid-column: 1 / -1;\n  display: flex;\n  flex-wrap: wrap;\n  gap: 6px 14px;\n  font-size: 12px;\n  line-height: 18px;\n  color: var(--dsw-alias-label-secondary);\n  font-variant-numeric: tabular-nums;\n}\n\n@keyframes abPPulse {\n  50% { opacity: 0.4; }\n}\n\n@media (prefers-reduced-motion: reduce) {\n  .abPCapsule,\n  .abPDrawer,\n  .abPAllToggle svg,\n  .abPOfflineToggle svg,\n  .abPCapsule[data-loading] .abPCapsuleDot,\n  .abPCapsule[data-loading] .abPCapsuleCount {\n    transition: none;\n    animation: none;\n  }\n}\n"

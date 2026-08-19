@@ -87,8 +87,12 @@ export interface NewTask {
   readonly workspacePath: string
   readonly content: string
   readonly mode: DeliveryMode
-  /** Harness message identity, recorded before delivery so the claimed listener can find the row. */
-  readonly messageId: string
+  /**
+   * Harness message identity, recorded before delivery so the claimed
+   * listener can find the row. Absent for a blocked DAG task: it is created
+   * but not delivered until its dependencies settle.
+   */
+  readonly messageId?: string
   /** Rework count; starts at 0 for a fresh task. */
   readonly retries: number
   /**
@@ -281,7 +285,7 @@ export class TaskLedger {
         content: task.content,
         status: 'submitted',
         mode: task.mode,
-        messageId: task.messageId,
+        ...(task.messageId !== undefined ? { messageId: task.messageId } : {}),
         retries: task.retries,
         createdAt: now,
         updatedAt: now,

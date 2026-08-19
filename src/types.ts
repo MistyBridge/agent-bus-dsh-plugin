@@ -12,6 +12,17 @@
 
 import type { SessionId } from '@deepseek-ai/dsh-session'
 
+declare module '@deepseek-ai/cordis' {
+  interface Events {
+    /**
+     * A task settled successfully; the DAG scheduler releases its dependents.
+     * @param taskId - the settled task's id.
+     * @mode emit
+     */
+    'agent-bus/settle'(taskId: string): void
+  }
+}
+
 /**
  * Ledger-owned task identity. Independent of the harness `MessageId` because
  * a task exists in `submitted` before any delivery has produced one.

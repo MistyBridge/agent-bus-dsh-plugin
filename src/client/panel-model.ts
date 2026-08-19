@@ -71,6 +71,14 @@ export interface TaskView {
   readonly executorLive: boolean
   /** Host-set when the task has entered the archive phase (completed ≥ 24h). */
   readonly archived?: boolean
+  /** DAG predecessors (task ids), in declaration order; empty when none. */
+  readonly dependencies: readonly string[]
+  /** Tasks that depend on this one (reverse edges for the DAG view). */
+  readonly dependents: readonly string[]
+  /** Unsettled dependencies; empty means the task is ready to dispatch. */
+  readonly blockedBy: readonly string[]
+  /** Whether the scheduler (not a tool call) delivered this task. */
+  readonly auto: boolean
   readonly createdAt: string
   readonly updatedAt: string
   readonly ageMs: number
