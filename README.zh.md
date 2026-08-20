@@ -76,11 +76,13 @@ web-app bundle 已挂载存储和工作区注册表。自定义或 headless prof
 
 ## Agent Bus 对比 Sub-agent
 
-Harness 已经有 **sub-agent**：父会话调用 `spawn_subagent`，**新开一个子会话**（全新上下文），干完活，把一份**摘要**交回父会话。适合「隔离着查一下再回来」。
+### 为什么放弃 sub-agent 架构
 
-不适合「几个专家会话要活几个小时、互相派活」。
+Harness 已经有 **sub-agent**：父会话调用 `spawn_subagent`，子会话拉起来干活，交回一份**摘要**。适合「隔离着查一下再回来」。
 
-总线上的每一个对象**就是一个普通的 DeepSeek Harness 会话**——和你在 dsh 里已经会配的那种。Sub-agent 是子进程式的孩子：agent 类型 + capability mode + 可选 persona，工具带是借来的、被收窄的。Bus 上的 peer 保住自己的 **skill**、**MCP**、**插件组**、**权限预设**和**模型**。组团队就是这么组的：编码会话挂仓库 skill 和代码 MCP，调研会话挂网页工具，验收会话走更严的 allowlist。多租户要挂的也是这套会话模型——**按租户 / 按角色的权限组与 dsh 插件组**，而不是「父会话这次 spawn 了什么」。
+团队没有建在这套架构上。子代理**通常继承主会话的权限组和配置**——skill、MCP、插件组、模型、allowlist。你可以裁工具带（agent 类型、capability mode、persona），但很难做到：编码会话自己的仓库 MCP、调研会话自己的网页 MCP、验收会话更严的租户 allowlist——三套不同的配置。专家团队要的就是这种精细化配置，继承做不到。
+
+所以总线上的每一个对象**就是一个普通的 DeepSeek Harness 会话**——和你在 dsh 里已经会配的那种。它保住自己的 **skill**、**MCP**、**插件组**、**权限预设**和**模型**。组团队就是这么组的；多租户要挂的也是这套会话模型——**按租户 / 按角色的权限组与 dsh 插件组**，而不是「父会话这次 spawn 了什么」。
 
 | | **Sub-agent** | **Agent Bus** |
 |---|---|---|

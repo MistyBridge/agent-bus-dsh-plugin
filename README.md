@@ -76,11 +76,13 @@ Pick the lightest channel that still matches the ask. Chat-as-task is how work g
 
 ## Agent Bus vs sub-agents
 
-Harness already ships **sub-agents**: the parent calls `spawn_subagent`, a **new child session** boots with a fresh context window, does the job, and returns a **summary** to the parent. That is the right tool for “go explore this in isolation and come back.”
+### Why we did not build on sub-agents
 
-It is the wrong tool for a **team of specialists that live for hours**.
+Harness already ships **sub-agents**: the parent calls `spawn_subagent`, a child boots, does the job, and returns a **summary**. That is the right tool for “go explore this in isolation and come back.”
 
-Every bus peer **is a normal DeepSeek Harness session** — the same kind of object you already customize. A sub-agent is a child with a borrowed, narrowed toolbelt (agent type, capability mode, optional persona). A bus peer keeps its own **skills**, **MCP servers**, **plugin set**, **permission preset**, and **model**. That is how you actually staff a team: a coder session with repo skills and a code MCP, a researcher with web tools, a reviewer on a tighter allowlist. The same session model is what a multi-tenant deployment hangs **permission groups** and **plugin groups** on — per tenant, per role, not “whatever the parent spawned.”
+We did **not** put the team on that architecture. A child **inherits the parent’s permission group and session config** — skills, MCP servers, plugin set, model, allowlist. You can trim the toolbelt (agent type, capability mode, persona). You cannot give the coder a repo MCP, the researcher a web MCP, and the reviewer a tighter tenant allowlist as three different configurations. Fine-grained staffing is exactly what a specialist team needs, and inheritance makes it hard.
+
+So every bus peer **is a normal DeepSeek Harness session** — the same object you already customize. It keeps its own **skills**, **MCP servers**, **plugin group**, **permission preset**, and **model**. That is how you staff a team, and it is the same session model a multi-tenant host hangs **permission groups** and **plugin groups** on: per tenant, per role, not “whatever the parent spawned.”
 
 | | **Sub-agent** | **Agent Bus** |
 |---|---|---|
