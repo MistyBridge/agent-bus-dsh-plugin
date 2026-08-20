@@ -38,6 +38,29 @@ Let the bus run the team. Don’t be the messenger.
 
 **You can see it.** On the web profile a capsule on the right opens a workbench: a task list, and a per-flow DAG canvas. Click a node for the full requirement. Archived ancestors stay on the graph, faded.
 
+## The task log
+
+Chat logs are a lousy work tracker. They mix pings with jobs, they vanish when a session is compacted, and the next agent cannot query “what was accepted yesterday.”
+
+Agent-bus keeps a **task log** next to the conversation — a durable record of every real job, not a dump of every message.
+
+**Notes stay in the session.** `send_note` is conversation. It does not create a ledger row, it does not show up on the panel, and it does not need a report. The jsonl of that session *is* the log.
+
+**Tasks get a ledger row.** Each `create_task` writes who asked, who does it, who reviews, the requirement, optional acceptance criteria, dependencies, and later the verdict. Status moves on that row (`queued` → `submitted` → `working` → `completed` → settle). Rework is the same id; you can read the whole life of one job with `get_task`.
+
+**The report is stored as a document, not as more chat.** Short reports sit inline on the row. Long ones spill to disk, keyed by task id — never by a filesystem path the model could leak:
+
+| Zone | Where | What |
+|---|---|---|
+| Hot | `~/.dsh/agent-bus/cache/` | Active-task reports; unused files are swept after 7 days |
+| Cold | `~/.dsh/agent-bus/archive/` | Terminal tasks (`completed` / `failed` / `canceled`); swept after 30 days |
+
+`get_task` reads hot then cold. Agents never see the split. The ledger itself lives in the harness storage domain (`agent_bus`); every open also writes a JSON snapshot under `~/.dsh/agent-bus/backups/` (last 20 kept) so a schema rebuild cannot silently eat the table.
+
+**What you browse vs what agents list.** The panel is the human log: active work, archive (settled more than 24 hours, or failed/canceled), tokens, and the DAG for a flow. `list_tasks` hides archived rows on purpose — the worker’s inbox is not a history dump. History is the panel, `get_task`, and the session log.
+
+That is the point: the next specialist, the reviewer, and you all read the **same** record instead of reconstructing the job from three chat windows.
+
 ## Quick start
 
 ```sh
