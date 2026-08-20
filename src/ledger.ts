@@ -52,10 +52,12 @@ const ALLOWED_TRANSITIONS: Readonly<Record<TaskStatus, readonly TaskStatus[]>> =
   // v1.4: queued is the pre-delivery phase — the scheduler transitions it to
   // submitted on dispatch; failure propagation and cancel may close it early.
   // v1.5: submitted → queued is the delivery-failure fallback (the target
-  // could not be woken; the sweep retries).
+  // could not be woken; the sweep retries); working → submitted is the
+  // stranded-recovery fallback (the executor went idle without reporting, so
+  // the heartbeat re-delivers and the task is claimed again).
   queued: ['submitted', 'failed', 'canceled'],
   submitted: ['working', 'failed', 'canceled', 'queued'],
-  working: ['completed', 'input-required', 'failed', 'canceled'],
+  working: ['completed', 'input-required', 'failed', 'canceled', 'submitted'],
   'input-required': ['working', 'failed', 'canceled'],
   'auth-required': [],
   completed: ['submitted'],

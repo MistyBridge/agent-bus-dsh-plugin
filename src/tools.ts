@@ -61,6 +61,7 @@ interface TaskView {
   readonly from: string
   readonly to?: string
   readonly content: string
+  readonly title?: string
   readonly report?: string
   readonly outcome?: string
   readonly reason?: string
@@ -78,6 +79,7 @@ function view(task: TaskRecord): TaskView {
     from: task.assignedBy,
     ...(task.assignedTo !== undefined ? { to: task.assignedTo } : {}),
     content: task.content,
+    ...(task.title !== undefined ? { title: task.title } : {}),
     ...(task.report !== undefined ? { report: task.report } : {}),
     ...(task.outcome !== undefined ? { outcome: task.outcome } : {}),
     ...(task.reason !== undefined ? { reason: task.reason } : {}),
@@ -138,7 +140,8 @@ export function renderTaskRow(t: TaskView): string {
     : t.status === 'completed' && t.outcome === undefined
       ? 'completed 待验收'
       : t.status
-  const head = `${t.id} [${badge}] ${t.content.slice(0, 80)}`
+  const label = t.title !== undefined && t.title !== '' ? t.title : t.content.slice(0, 80)
+  const head = `${t.id} [${badge}] ${label}`
   const report = t.report !== undefined
     ? `\n  submitted result: ${t.report.slice(0, 400)}`
     : ''
@@ -157,6 +160,7 @@ interface TaskDetailView {
   readonly from: string
   readonly to?: string
   readonly content: string
+  readonly title?: string
   readonly acceptanceCriteria?: string
   readonly handoffs?: { fromTask: string; document: string; at: string }[]
   readonly report?: string
@@ -177,6 +181,7 @@ function detailView(task: TaskRecord): TaskDetailView {
     from: task.assignedBy,
     ...(task.assignedTo !== undefined ? { to: task.assignedTo } : {}),
     content: task.content,
+    ...(task.title !== undefined ? { title: task.title } : {}),
     ...(task.acceptanceCriteria !== undefined ? { acceptanceCriteria: task.acceptanceCriteria } : {}),
     ...(task.handoffs !== undefined
       ? { handoffs: task.handoffs.map(handoff => ({
@@ -241,6 +246,7 @@ export function renderTaskDetail(t: TaskDetailView): string {
     `updated: ${t.updatedAt}`,
     'task:',
     t.content,
+    ...(t.title !== undefined ? ['title:', t.title] : []),
   ]
   if (t.acceptanceCriteria !== undefined) lines.push('acceptance criteria:', t.acceptanceCriteria)
   if (t.handoffs !== undefined && t.handoffs.length > 0) {
@@ -695,6 +701,12 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       const oldExecutor = task.assignedTo
       const wasWorking = task.status === 'working' || task.status === 'input-required'
       const wasQueued = task.status === 'queued'
+      // Work-state detection: with the one-task-per-turn delivery model, a
+      // working task IS the task the executor is currently on. Reassigning
+      // while it runs must interrupt that turn so the old worker cannot
+      // keep grinding on work that was taken from it.
+      const executorOnThisTask = task.status === 'working' && oldExecutor !== undefined
+        && ctx.agents.get(oldExecutor) !== undefined
       const reassigned = await ledger.reassign(taskId, {
         ...(newExecutor !== undefined ? { executor: newExecutor } : {}),
         ...(newReviewer !== undefined ? { reviewer: newReviewer } : {}),
@@ -717,10 +729,21 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
           await ledger.transition(taskId, 'queued')
         }
       }
-      // The old executor is told the task moved (if it was mid-flight).
-      if (oldExecutor !== undefined && newExecutor !== undefined && oldExecutor !== newExecutor && wasWorking) {
+      // The old executor's in-flight turn is interrupted and told the task
+      // moved (if it was mid-flight) — the reclaimed work is voided so it
+      // cannot keep executing a task that no longer belongs to it.
+      if (oldExecutor !== undefined && newExecutor !== undefined && oldExecutor !== newExecutor && executorOnThisTask) {
+        const oldWorker = ctx.agents.get(oldExecutor)
+        if (oldWorker !== undefined) {
+          try {
+            oldWorker.cancel({ kind: 'user' }, { keepInbox: true })
+          } catch {
+            // The interrupt is advisory; a worker that already settled its
+            // turn needs no interruption.
+          }
+        }
         notifySession(ctx, oldExecutor, taskId,
-          `任务 ${taskId} 已转派给 ${newExecutor.slice(0, 8)},你不再负责该任务。`,
+          `任务 ${taskId} 已转派给 ${newExecutor.slice(0, 8)},你不再负责该任务,当前工作已作废。`,
           'reassign_task')
       }
       return {
@@ -867,6 +890,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
     parameters: {
       target: { type: 'string', required: true, description: 'Session id of the peer, from list_peers.' },
       content: { type: 'string', required: true, description: 'The task instruction or answer.' },
+      title: { type: 'string', description: 'Short display title (≤80 chars); lists and DAG nodes prefer it over the content.' },
       mode: {
         type: 'string',
         enum: ['followup', 'steer'],

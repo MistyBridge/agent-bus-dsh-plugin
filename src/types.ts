@@ -165,6 +165,8 @@ export interface TaskRecord {
   readonly workspacePath: string
   /** The task instruction delivered to the recipient. */
   readonly content: string
+  /** Short display title; list/DAG nodes prefer it over content. */
+  readonly title?: string
   /** Current lifecycle position. */
   readonly status: TaskStatus
   /** Requested delivery mode. */

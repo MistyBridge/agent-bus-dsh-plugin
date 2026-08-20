@@ -37,7 +37,7 @@ import { ReportStore } from './external.ts'
 import { TaskLedger } from './ledger.ts'
 import { buildPanelSnapshot } from './panel.ts'
 import { DispatchRateLimiter } from './rate-limit.ts'
-import { buildDelayedMessage, deliverTask } from './delivery.ts'
+import { buildDelayedMessage, buildTaskMessage, deliverTask } from './delivery.ts'
 import { dispatchOne, dispatchReadyTasks, releaseDependents } from './scheduler.ts'
 import { setWakeRoute } from './wake.ts'
 import { notifySession, registerAgentBusTools, type ToolsConfig } from './tools.ts'
@@ -74,6 +74,8 @@ export interface Config {
   wakeProvider?: string
   /** Model id for woken dormant sessions; defaults to inheriting from a live session. */
   wakeModel?: string
+  /** How long a working/submitted task may sit with an IDLE live executor before the heartbeat re-delivers it (default `300000`, 5 min). */
+  retryIdleMs?: number
   /** Reports longer than this are externalized to the report store (default `400`). */
   maxInlineReport?: number
   /** Prompt-section order for the usage policy (default `118`). */
@@ -349,12 +351,49 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // initiator is the one who can decide to redo it.
   const timeoutMs = config.taskTimeoutMs ?? 7_200_000
   const offlineGraceMs = config.offlineGraceMs ?? 900_000
+  const retryIdleMs = config.retryIdleMs ?? 300_000
   const lastOfflineNotice = new Map<string, number>()
+  const lastHeartbeat = new Map<string, number>()
   const timer = setInterval(() => {
     const cutoff = Date.now() - timeoutMs
     const now = Date.now()
     for (const row of ledger.listAll()) {
-      if (row.status !== 'working' && row.status !== 'input-required') continue
+      if (row.status !== 'working' && row.status !== 'input-required'
+        && row.status !== 'submitted') continue
+      // Stranded-recovery heartbeat (v1.6): a working or submitted task
+      // whose LIVE executor sits IDLE past the window lost its turn (the
+      // model stopped early, the step was rejected, the process restarted)
+      // — re-deliver so the driver claims it afresh. This is teams'
+      // owned-open-task retry expressed in our delivery model; the 2h
+      // timeout stays the backstop.
+      if ((row.status === 'working' || row.status === 'submitted')
+        && row.assignedTo !== undefined) {
+        const executor = ctx.agents.get(row.assignedTo)
+        if (executor !== undefined && executor.status === 'idle'
+          && now - Date.parse(row.updatedAt) >= retryIdleMs) {
+          const key = String(row.id)
+          const last = lastHeartbeat.get(key) ?? 0
+          if (now - last >= retryIdleMs) {
+            lastHeartbeat.set(key, now)
+            void (async () => {
+              const fresh = ledger.get(row.id)
+              if (fresh === undefined) return
+              const worker = ctx.agents.get(fresh.assignedTo!)
+              if (worker === undefined || worker.status !== 'idle') return
+              const advanced = fresh.status === 'working'
+                ? await ledger.transition(fresh.id, 'submitted')
+                : { ok: true as const }
+              if (!advanced.ok) return
+              const message = buildTaskMessage(fresh.assignedBy, fresh.id,
+                `${fresh.content}\n\n[检测到任务中断,已重新投递,请继续执行并调用 report_task。]`,
+                'retry')
+              await ledger.recordDelivery(fresh.id, message.id)
+              deliverTask(worker, message, 'followup')
+            })()
+          }
+        }
+      }
+      if (row.status === 'input-required') continue
       // Offline-executor grace (v1.5): a working task whose executor has been
       // away past the grace period asks the INITIATOR to decide — reassign,
       // cancel, or wait. Never auto-fails: offline is not failure, the 2h
@@ -396,22 +435,46 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   const NOTE_MAX_ATTEMPTS = 3
   const noteSweep = setInterval(() => {
     void (async () => {
+      // Batch by recipient: every undelivered note for one live recipient is
+      // delivered in ONE followup (one turn) instead of N queued messages —
+      // the fallback-mailbox pattern from agent-teams. Each segment keeps
+      // its own delayed stamp and sender.
+      const byRecipient = new Map<string, ReturnType<typeof ledger.listPendingNotes>>()
       for (const note of ledger.listPendingNotes()) {
-        const recipient = ctx.agents.get(note.recipient)
+        const list = byRecipient.get(String(note.recipient)) ?? []
+        list.push(note)
+        byRecipient.set(String(note.recipient), list)
+      }
+      for (const [recipientId, notes] of byRecipient) {
+        const recipient = ctx.agents.get(recipientId as never)
         if (recipient === undefined) continue
-        if (note.attempts >= NOTE_MAX_ATTEMPTS) {
+        const dropped: typeof notes = []
+        const deliverable = notes.filter(note => {
+          if (note.attempts >= NOTE_MAX_ATTEMPTS) {
+            dropped.push(note)
+            return false
+          }
+          return true
+        })
+        for (const note of dropped) {
           await ledger.deleteNote(note.id)
           notifySession(ctx, note.sender, TaskId(note.id),
             `你的离线消息(发送于 ${note.sentAt})经过 ${NOTE_MAX_ATTEMPTS} 次补投仍未送达,已丢弃。如需重新发送,请调用 send_note。`,
             'reminder')
-          continue
         }
+        if (deliverable.length === 0) continue
         try {
-          const message = buildDelayedMessage(note.sender, note.id, note.content, note.sentAt)
+          const first = deliverable[0]!
+          const body = deliverable.map(note =>
+            `[来自 ${note.sender.slice(0, 8)},延迟送达,原发送时间 ${note.sentAt}]\n${note.content}`,
+          ).join('\n\n---\n\n')
+          const message = buildDelayedMessage(first.sender, first.id, body, first.sentAt)
           deliverTask(recipient, message, 'followup')
-          await ledger.deleteNote(note.id)
+          for (const note of deliverable) await ledger.deleteNote(note.id)
         } catch {
-          await ledger.markNoteAttempt(note.id, note.attempts + 1)
+          for (const note of deliverable) {
+            await ledger.markNoteAttempt(note.id, note.attempts + 1)
+          }
         }
       }
     })()

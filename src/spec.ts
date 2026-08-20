@@ -55,6 +55,8 @@ export const taskRecord = z.object({
   assignedReviewer: sessionId.optional(),
   workspacePath: z.string(),
   content: z.string(),
+  /** Short display title (v1.6); list/DAG nodes prefer it over content. */
+  title: z.string().max(80).optional(),
   status: z.enum([
     'queued',
     'submitted',
