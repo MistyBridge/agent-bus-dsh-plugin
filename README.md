@@ -74,6 +74,36 @@ flow     create_flow + tasks    →  DAG auto-dispatches each node after its pre
 
 Pick the lightest channel that still matches the ask. Chat-as-task is how work gets stuck in `working`. Task-as-chat is how you lose review.
 
+## Agent Bus vs sub-agents
+
+Harness already ships **sub-agents**: the parent calls `spawn_subagent`, a **new child session** boots with a fresh context window, does the job, and returns a **summary** to the parent. That is the right tool for “go explore this in isolation and come back.”
+
+It is the wrong tool for a **team of specialists that live for hours**.
+
+| | **Sub-agent** | **Agent Bus** |
+|---|---|---|
+| Unit of work | Child session spawned for one job, then gone | `followup()` into an existing peer session |
+| Topology | Star: parent is the hub | Peers in one workspace + a durable ledger |
+| Who reviews | The parent reads a summary | A first-class reviewer accepts or reworks the **same** task id |
+| Ordering | Parent must orchestrate every next spawn | DAG: B is not delivered until A is settled |
+| Failure | Parent has to notice | Terminal fail/cancel propagates down the chain |
+| After restart | The play lives in the parent’s context | Ledger + inbox checkpoints survive |
+| Parallelism | Many children at once from one parent | Many peers at once; each peer still one inbox item per turn |
+
+### Where the cost actually goes
+
+No fake speedup numbers — the difference is **where tokens and latency are spent**.
+
+| Cost | Sub-agent | Agent Bus |
+|---|---|---|
+| **Prompt cache** | Every spawn pays a **cold** prefix (system prompt, tools, instructions). | A specialist is a long-lived session. The next task is another user turn on a **warm** prefix. |
+| **Orchestrator context** | Each child’s summary lands **in the parent window**. N jobs → parent context grows with N summaries. | The initiator gets a short inbox notice. The full report lives in the ledger (and on disk when large). `get_task` is on demand. |
+| **Time to first token** | Session boot + first decode on a cold cache. | Idle live peer: next turn **now**, no new process. |
+| **Specialist memory** | Dies with the child. Job 4 does not remember job 3 unless the parent stuffed it into the next spawn prompt. | The same coder session still has job 3 in its window (and files in the workspace). Handoffs carry the rest. |
+| **Throwaway explore** | **Use this.** Isolated window, parent cache untouched. | Don’t. A peer session is a person on the team, not a sandbox. |
+
+**Rule of thumb:** spawn a sub-agent to protect the caller’s context for a one-shot. Use the bus when the callee **is** a named teammate who will take the next job after this one.
+
 ## Tools
 
 | You want to… | Use |
