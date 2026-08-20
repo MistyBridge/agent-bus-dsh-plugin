@@ -22,10 +22,9 @@ Without this plugin:
 
 - A planner cannot give a coder a job. You paste the brief.
 - A coder cannot wait for a reviewer. You paste the patch.
-- A greeting sent as a “task” sits in `working` until a two-hour timeout, because nothing ever reports or settles.
 - When step 3 fails, you reconstruct steps 1–2 from chat logs.
 
-That is not a team. That is you as a human bus.
+Let the bus run the team. Don’t be the messenger.
 
 ## What you actually get
 
