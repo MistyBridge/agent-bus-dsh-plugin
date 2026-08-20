@@ -50,6 +50,8 @@ export interface TaskView {
   readonly status: TaskStatus
   readonly settled: boolean
   readonly content: string
+  /** Short display title (v1.6); null falls back to the content preview. */
+  readonly title: string | null
   readonly contentPreview: string
   readonly mode: DeliveryMode
   readonly assignedBy: string
