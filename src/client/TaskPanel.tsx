@@ -461,7 +461,7 @@ function TaskCard({
     >
       <div className={css.abPTaskLine}>
         <StatusBadge task={task} />
-        <span className={css.abPTaskPreview}>{task.contentPreview}</span>
+        <span className={css.abPTaskPreview}>{task.title ?? task.contentPreview}</span>
       </div>
       <div className={css.abPTaskMeta}>
         {`任务时间 ${relativeTime(task.updatedMs, nowMs)}`}

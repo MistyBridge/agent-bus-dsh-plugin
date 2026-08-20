@@ -731,7 +731,7 @@ export function DagView({
                     data-dragging={draggingId === box.id || undefined}
                     disabled={faded}
                     aria-pressed={pinnedId === box.id}
-                    aria-label={`${statusLabel(box.task.status, box.task.outcome)} ${box.task.contentPreview}`}
+                    aria-label={`${statusLabel(box.task.status, box.task.outcome)} ${box.task.title ?? box.task.contentPreview}`}
                     onMouseEnter={() => { if (!faded) setHoverId(box.id) }}
                     onFocus={() => { if (!faded) setHoverId(box.id) }}
                     onPointerDown={event => onNodePointerDown(event, box.id)}
@@ -744,7 +744,7 @@ export function DagView({
                       <StatusBadge task={box.task} />
                     </span>
                     <span className="abPDagNodeLabel">
-                      {truncateCodePoints(box.task.contentPreview, 18)}
+                      {truncateCodePoints(box.task.title ?? box.task.contentPreview, 18)}
                     </span>
                     {mark !== null && <span className="abPDagMark">{mark}</span>}
                   </button>
