@@ -39,6 +39,7 @@ import { buildPanelSnapshot } from './panel.ts'
 import { DispatchRateLimiter } from './rate-limit.ts'
 import { buildDelayedMessage, deliverTask } from './delivery.ts'
 import { dispatchOne, dispatchReadyTasks, releaseDependents } from './scheduler.ts'
+import { setWakeRoute } from './wake.ts'
 import { notifySession, registerAgentBusTools, type ToolsConfig } from './tools.ts'
 import { TaskId } from './types.ts'
 
@@ -69,6 +70,10 @@ export interface Config {
   taskTimeoutMs?: number
   /** How long a working task's offline executor may be gone before the initiator is asked to decide (default `900000`, 15 min). */
   offlineGraceMs?: number
+  /** Model route for woken dormant sessions; defaults to inheriting from a live session. */
+  wakeProvider?: string
+  /** Model id for woken dormant sessions; defaults to inheriting from a live session. */
+  wakeModel?: string
   /** Reports longer than this are externalized to the report store (default `400`). */
   maxInlineReport?: number
   /** Prompt-section order for the usage policy (default `118`). */
@@ -150,6 +155,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   })
 
   const ledger = await TaskLedger.open(ctx)
+  setWakeRoute({
+    ...(config.wakeProvider !== undefined ? { provider: config.wakeProvider } : {}),
+    ...(config.wakeModel !== undefined ? { model: config.wakeModel } : {}),
+  })
   const limiter = new DispatchRateLimiter(resolved.maxSendsPerMinute, 60_000)
   // Separate window for the message channel: chatter must not exhaust the
   // task quota, and a dispatch loop must not be able to hide behind message
