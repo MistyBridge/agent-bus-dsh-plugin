@@ -100,6 +100,8 @@ export interface NewTask {
   readonly assignedReviewer?: SessionId
   readonly workspacePath: string
   readonly content: string
+  /** Short display title (REQUIRED); list/DAG nodes display it. */
+  readonly title: string
   readonly mode: DeliveryMode
   /**
    * Harness message identity, recorded before delivery so the claimed
@@ -296,6 +298,18 @@ export class TaskLedger {
    */
   private async migrateQueued(): Promise<void> {
     for (const row of this.listAll()) {
+      // v1.6: pre-title rows get a title derived from their content (display
+      // continuity; the title field is required for NEW tasks only).
+      if (row.title === undefined || row.title === '') {
+        const migrated: StoredTaskRecord = {
+          ...row,
+          title: row.content.trim().slice(0, 80) || 'untitled',
+          dependencies: row.dependencies !== undefined ? [...row.dependencies] : undefined,
+          handoffs: row.handoffs !== undefined ? [...row.handoffs] : undefined,
+        }
+        await this.table.put(row.id, migrated)
+        continue
+      }
       if (row.status !== 'submitted' || row.messageId !== undefined) continue
       const migrated: StoredTaskRecord = {
         ...row,
@@ -386,6 +400,17 @@ export class TaskLedger {
    */
   async record(task: NewTask, maxPending: number): Promise<LedgerResult> {
     return this.enqueue(async () => {
+      // Title is a required display field (v1.6): every new task carries one.
+      const title = task.title.trim()
+      if (title.length === 0) {
+        return { ok: false as const, message: 'task title is required (1–80 characters)' }
+      }
+      if (title.length > 80) {
+        return {
+          ok: false as const,
+          message: `task title is ${title.length} characters, over the 80 limit`,
+        }
+      }
       const all = this.listAll()
       const violation = validateDependencies(task.id, task.dependencies, all, task.workspacePath, task.flowId)
       if (violation !== null) {
@@ -408,6 +433,7 @@ export class TaskLedger {
         assignedTo: task.assignedTo,
         workspacePath: task.workspacePath,
         content: task.content,
+        title,
         status: blocked ? 'queued' : 'submitted',
         mode: task.mode,
         // A queued row is undelivered BY DEFINITION: it must never carry a

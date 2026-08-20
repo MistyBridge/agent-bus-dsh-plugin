@@ -890,7 +890,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
     parameters: {
       target: { type: 'string', required: true, description: 'Session id of the peer, from list_peers.' },
       content: { type: 'string', required: true, description: 'The task instruction or answer.' },
-      title: { type: 'string', description: 'Short display title (≤80 chars); lists and DAG nodes prefer it over the content.' },
+      title: { type: 'string', required: true, description: 'Short display title (1–80 chars); lists and DAG nodes display it.' },
       mode: {
         type: 'string',
         enum: ['followup', 'steer'],
@@ -961,6 +961,8 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         ? admitContent(args.acceptance_criteria, 2000)
         : undefined
       if (criteria !== undefined && !criteria.ok) throw new Error(criteria.message)
+      const title = admitContent(String(args.title ?? ''), 80)
+      if (!title.ok) throw new Error(title.message)
 
       const mode: DeliveryMode = args.mode === 'steer' ? 'steer' : 'followup'
 
@@ -1030,6 +1032,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         ...(dependencies !== undefined ? { dependencies } : {}),
         ...(criteria?.ok === true ? { acceptanceCriteria: criteria.content } : {}),
         ...(flowId !== undefined ? { flowId } : {}),
+        title: title.content,
       }, config.maxPendingPerAgent)
       if (!recorded.ok) throw new Error(recorded.message)
 
@@ -1079,6 +1082,10 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         type: 'string',
         description: 'New minimum acceptance requirement; omit to keep the current one.',
       },
+      title: {
+        type: 'string',
+        description: 'New display title (1–80 chars); omit to keep the current one.',
+      },
       flow_id: {
         type: 'string',
         description: 'Move the task to another flow; the new flow must contain every dependency of '
@@ -1120,6 +1127,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       }
       const patch: {
         content?: string
+        title?: string
         dependencies?: TaskId[]
         acceptanceCriteria?: string
         flowId?: string
@@ -1128,6 +1136,11 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         const admitted = admitContent(args.content, config.maxContentLength)
         if (!admitted.ok) throw new Error(admitted.message)
         patch.content = admitted.content
+      }
+      if (args.title !== undefined) {
+        const admitted = admitContent(args.title, 80)
+        if (!admitted.ok) throw new Error(admitted.message)
+        patch.title = admitted.content
       }
       if (args.dependencies !== undefined) {
         patch.dependencies = (args.dependencies as string[]).map(id => TaskId(id))
