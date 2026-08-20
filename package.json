@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-bus",
   "version": "0.1.0",
-  "description": "Stop being the messenger. DeepSeek Harness agents in one workspace assign work, review it, and run multi-step DAG workflows on their own.",
+  "description": "Multi-agent orchestration for DeepSeek Harness. Sessions in one workspace assign work, review results, and run DAG workflows — without you as the messenger.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",

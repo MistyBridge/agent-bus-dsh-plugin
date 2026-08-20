@@ -8,9 +8,9 @@
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%5E22.19%20%7C%7C%20%3E%3D24-339933" alt="Node.js"></a>
 </p>
 
-**别再当 Agent 之间的传话筒。**
+**DeepSeek Harness 上的多 Agent 编排。** 别再当传话筒。
 
-dsh-agent-bus 是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件。它让同一工作区里的活跃会话可以互相派活、验收结果、按顺序跑完一个多步骤计划——投递走的还是你已经在用的 Inbox。
+dsh-agent-bus 是 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件：把同一工作区里的活跃会话编成一套班子——互相派活、验收对方产出、按 DAG 跑多步骤流程。投递走的还是你已经在用的 Inbox。
 
 专家还是那些专家。复制粘贴的人不再是你。
 

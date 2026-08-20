@@ -8,9 +8,9 @@
   <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%5E22.19%20%7C%7C%20%3E%3D24-339933" alt="Node.js"></a>
 </p>
 
-**Stop being the messenger between your agents.**
+**Multi-agent orchestration for DeepSeek Harness.** Stop being the messenger.
 
-dsh-agent-bus is a [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin. It lets live sessions in the same workspace assign work to each other, review the result, and run a multi-step plan in order — on the harness inbox you already have.
+dsh-agent-bus is a [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin that turns live sessions in one workspace into an orchestra: they assign work, review each other’s output, and run multi-step DAG workflows — on the inbox you already have.
 
 You keep the specialists. You stop copy-pasting.
 
