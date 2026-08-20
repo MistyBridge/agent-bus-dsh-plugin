@@ -2,93 +2,97 @@
 
 **English** | [中文](README.zh.md)
 
-Workspace collaboration for [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) agents: lightweight notes, a durable task lifecycle, and flow DAGs that schedule themselves.
+<p>
+  <a href="https://github.com/MistyBridge/dsh-agent-bus/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT"></a>
+  <a href="https://github.com/MistyBridge/dsh-agent-bus"><img src="https://img.shields.io/badge/platform-DeepSeek%20Harness-1a73e8" alt="DeepSeek Harness"></a>
+  <a href="https://nodejs.org/"><img src="https://img.shields.io/badge/node-%5E22.19%20%7C%7C%20%3E%3D24-339933" alt="Node.js"></a>
+</p>
 
-Live sessions in the same workspace can talk, assign work, and orchestrate multi-step jobs. Delivery uses the harness inbox (`followup()`, one item per turn). This plugin does not add a second queue. The ledger records tasks and flows; session logs are the record for notes.
+**Stop being the messenger between your agents.**
 
-## Features
+dsh-agent-bus is a [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin. It lets live sessions in the same workspace assign work to each other, review the result, and run a multi-step plan in order — on the harness inbox you already have.
 
-| | |
-|---|---|
-| **Two channels** | `send_note` for chat (no ledger, no acceptance). `create_task` for work that must be delivered and reviewed. |
-| **Route by scope** | SMALL → note · MEDIUM → task · LARGE → flow. The model is told to pick the matching channel. |
-| **Flow DAGs** | `create_flow` is a named container. Plan first, then split into tasks (`flow_id` + `dependencies`). One flow is one DAG; cross-flow dependencies are rejected. |
-| **Event-driven dispatch** | Ledger writes emit `TaskChanged`. The panel listens on SSE and POSTs `/dispatch` when a queued task is ready. A 60s host sweep covers offline clients. |
-| **Failure propagation** | A terminal failure (`failed` / `canceled`) fails dependents recursively. Rework is the same task id (`settle` failure → `submitted`, `retries++`). |
-| **Handoffs** | After settle, the executor can attach structured context for each downstream task. Dispatch concatenates those documents into the next worker's content. |
-| **Resilience** | Offline notes queue and deliver when the peer is live. `reassign_task` moves executor or reviewer. Offline-executor grace notifies the initiator instead of failing immediately. |
-| **Panel** | A workbench capsule on the web profile: task list, per-flow DAG canvas, tokens, archive. |
+You keep the specialists. You stop copy-pasting.
 
-## Architecture
+## Why this exists
 
-```
-┌─────────────────────────── Browser panel ────────────────────────────┐
-│  Capsule → task list · flow list → DAG (nodes = tasks in that flow)  │
-│  Scheduler: TaskChanged → dependencies settled? → POST /dispatch     │
-└───────────────▲──────────────────────────────┬───────────────────────┘
-                │ SSE                          │ HTTP
-┌───────────────┴──────────────────────────────▼───────────────────────┐
-│                     dsh-agent-bus (host plugin)                      │
-│  ledger (storage domain agent_bus)                                   │
-│    tasks:  queued → submitted → working → completed → settle         │
-│    flows:  container (active / archived is derived)                  │
-│    handoffs · pending notes                                          │
-└───────────────▲──────────────────────────────┬───────────────────────┘
-                │ followup()                   │ claimed / discarded
-┌───────────────┴──────────────────────────────▼───────────────────────┐
-│                 dsh agent inbox (execution authority)                │
-│           One follow-up per turn; idle sessions take the next item   │
-└──────────────────────────────────────────────────────────────────────┘
-```
+Harness already runs several agents in one workspace. It does not let them *collaborate*.
 
-There is no receive-side tool. `followup()` turns a delivery into an ordinary turn on the peer; the worker reads it as user input.
+Without this plugin:
 
-## Tools
+- A planner cannot give a coder a job. You paste the brief.
+- A coder cannot wait for a reviewer. You paste the patch.
+- A greeting sent as a “task” sits in `working` until a two-hour timeout, because nothing ever reports or settles.
+- When step 3 fails, you reconstruct steps 1–2 from chat logs.
 
-| Scope | Tool | Role |
-|---|---|---|
-| SMALL | `send_note` | Note / question / ping. No task row. Offline peers are queued and flushed when they come back. |
-| MEDIUM | `create_task` | One task node: content, optional `dependencies`, `acceptance_criteria`, `flow_id`, `reviewer`. Unsettled deps stay `queued` until the scheduler delivers. |
-| LARGE | `create_flow` | Flow container. Write the plan, then create tasks into the DAG. |
-| Lifecycle | `report_task` / `settle_task` / `cancel_task` / `request_input` / `reassign_task` | Finish, accept or rework, cancel (propagates), pause for input, retarget executor or reviewer. |
-| Chain | `submit_handoff` | Attach a handoff document to each downstream task after you settle. |
-| Edit / query | `edit_task` / `list_flows` / `list_tasks` / `get_task` | Edit an undispatched task; list flows and active tasks; read a full record. |
-| Discovery | `list_peers` / `update_card` | Live peers and self-declared capability cards. |
+That is not a team. That is you as a human bus.
 
-## Install
+## What you actually get
+
+**Talk stays talk.** A question, a ping, a “look at this” is `send_note`. No ledger, no review, no timeout theatre. If the peer is offline, the note waits and delivers when they come back.
+
+**Work stays work.** `create_task` is a job with a body, an optional acceptance bar, and a reviewer. The worker reports; the reviewer accepts or sends the *same* task back with feedback. The id never changes across rework.
+
+**A plan can run without you in the loop.** `create_flow` is a named DAG. You (or the planner agent) write the plan, then create tasks with `flow_id` and `dependencies`. Task B is not even delivered until A is accepted. If A is canceled or fails for good, B and C fail with it — no orphaned workers.
+
+**The next agent reads the chain, not the archaeology.** After settle, the executor can attach a handoff (numbers, decisions, caveats). Dispatch concatenates that into the downstream task. Step 3 does not have to `get_task` its way through step 1.
+
+**You can see it.** On the web profile a capsule on the right opens a workbench: a task list, and a per-flow DAG canvas. Click a node for the full requirement. Archived ancestors stay on the graph, faded.
+
+## Quick start
 
 ```sh
 dsh plugin --profile web add dsh-agent-bus
-# local checkout while developing:
+dsh web
+```
+
+From a local checkout:
+
+```sh
 dsh plugin --profile web add .
 dsh --profile web --dump-config
 dsh web
 ```
 
-The profile must mount `storage`, `storage-json`, `storage-domain`, and `workspace`. The web-app bundle already does. A headless or custom profile must add those rows in its own `cordis.patch.yml`; load fails loudly otherwise — a gateway that cannot record must not boot as a silent prompt stub.
+The web-app bundle already mounts storage and the workspace registry. A custom or headless profile must declare `storage`, `storage-json`, `storage-domain`, and `workspace` in its own `cordis.patch.yml` — load fails loudly otherwise. A gateway that cannot record must not boot as a silent prompt.
 
 Requires Node.js `^22.19.0` or `>=24`.
 
-## Routing
+## How it works
+
+Delivery is the harness inbox: one `followup()` per turn, idle sessions take the next item. This plugin does **not** add a second queue.
+
+The plugin’s job is the **ledger** — who asked, who does it, what “done” means, what depends on what — plus a panel that reads that ledger.
+
+There is no receive-side tool. The worker sees an ordinary turn. They do the work and call `report_task`.
 
 ```
-A one-line ping or question     → send_note
-One deliverable to review       → create_task   (report → settle → rework / cancel)
-A multi-step effort             → create_flow   (plan → DAG → auto-dispatch + failure propagation)
+note     send_note              →  peer replies in prose (or not)
+task     create_task            →  queued → submitted → working → completed → settle
+flow     create_flow + tasks    →  DAG auto-dispatches each node after its predecessors settle
 ```
 
-Chat disguised as a task is how work gets stuck in `working`. A task disguised as chat drops the lifecycle that keeps work accountable.
+Pick the lightest channel that still matches the ask. Chat-as-task is how work gets stuck in `working`. Task-as-chat is how you lose review.
+
+## Tools
+
+| You want to… | Use |
+|---|---|
+| Ask a peer something that is not a job | `send_note` |
+| Give one peer one deliverable to review | `create_task` |
+| Run a multi-step plan in order | `create_flow`, then `create_task` with `flow_id` / `dependencies` |
+| Finish / accept / rework / stop / ask back / move the job | `report_task` · `settle_task` · `cancel_task` · `request_input` · `reassign_task` |
+| Pass context down the chain | `submit_handoff` |
+| Fix an undispatched node, or look things up | `edit_task` · `list_flows` · `list_tasks` · `get_task` |
+| See who is live, declare what you can do | `list_peers` · `update_card` |
 
 ## Docs
 
-| Doc | Contents |
+| | |
 |---|---|
-| [`docs/usage.md`](docs/usage.md) | Operator handbook (Chinese): tools, state machine, templates |
-| [`docs/v1.5-resilience-spec.md`](docs/v1.5-resilience-spec.md) | Durable notes, reassign, offline grace |
+| [`docs/usage.md`](docs/usage.md) | Handbook (Chinese): tools, state machine, templates |
+| [`docs/v1.5-resilience-spec.md`](docs/v1.5-resilience-spec.md) | Offline notes, reassign, offline grace |
 | [`docs/v1.4-event-driven-scheduling-spec.md`](docs/v1.4-event-driven-scheduling-spec.md) | Event-driven dispatch, flows, handoffs |
-| [`docs/v1.3-two-channel-spec.md`](docs/v1.3-two-channel-spec.md) | Notes vs tasks, notification vocabulary |
-| [`docs/v1.2-dag-spec.md`](docs/v1.2-dag-spec.md) | DAG data model (panel chapter superseded by v1.4) |
-| [`docs/v1.1-task-panel-spec.md`](docs/v1.1-task-panel-spec.md) | Panel snapshot contract |
 | [`docs/a2a-alignment.md`](docs/a2a-alignment.md) | A2A task-state alignment |
 
 ## License

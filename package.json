@@ -1,7 +1,7 @@
 {
   "name": "dsh-agent-bus",
   "version": "0.1.0",
-  "description": "Workspace agent collaboration for DeepSeek Harness: notes, task lifecycle, flow DAGs with auto-scheduling, and handoff documents",
+  "description": "Stop being the messenger. DeepSeek Harness agents in one workspace assign work, review it, and run multi-step DAG workflows on their own.",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
