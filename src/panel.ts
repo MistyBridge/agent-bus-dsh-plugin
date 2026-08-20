@@ -73,6 +73,7 @@ export interface TaskView {
   readonly status: TaskRecord['status']
   readonly settled: boolean
   readonly content: string
+  readonly title: string | null
   readonly contentPreview: string
   readonly mode: TaskRecord['mode']
   readonly assignedBy: string
@@ -358,6 +359,7 @@ export async function buildTaskView(
     acceptanceCriteria: task.acceptanceCriteria ?? null,
     flowId: task.flowId ?? null,
     content: task.content,
+    title: task.title ?? null,
     contentPreview: truncateCodePoints(task.content, 120),
     mode: task.mode,
     assignedBy: task.assignedBy,
