@@ -80,9 +80,14 @@ Harness already ships **sub-agents**: the parent calls `spawn_subagent`, a **new
 
 It is the wrong tool for a **team of specialists that live for hours**.
 
+Every bus peer **is a normal DeepSeek Harness session** — the same kind of object you already customize. A sub-agent is a child with a borrowed, narrowed toolbelt (agent type, capability mode, optional persona). A bus peer keeps its own **skills**, **MCP servers**, **plugin set**, **permission preset**, and **model**. That is how you actually staff a team: a coder session with repo skills and a code MCP, a researcher with web tools, a reviewer on a tighter allowlist. The same session model is what a multi-tenant deployment hangs **permission groups** and **plugin groups** on — per tenant, per role, not “whatever the parent spawned.”
+
 | | **Sub-agent** | **Agent Bus** |
 |---|---|---|
 | Unit of work | Child session spawned for one job, then gone | `followup()` into an existing peer session |
+| What the worker *is* | A disposable child: type + capability mode + optional persona | A **first-class session instance** you configured in dsh |
+| Skills / MCP / plugins | Inherited and usually trimmed for the spawn | **Per session**: its own skills, MCP servers, and plugin group |
+| Permissions | Parent’s envelope, narrowed | **Per session** (and, in a multi-tenant host, per permission group) |
 | Topology | Star: parent is the hub | Peers in one workspace + a durable ledger |
 | Who reviews | The parent reads a summary | A first-class reviewer accepts or reworks the **same** task id |
 | Ordering | Parent must orchestrate every next spawn | DAG: B is not delivered until A is settled |
@@ -102,7 +107,7 @@ No fake speedup numbers — the difference is **where tokens and latency are spe
 | **Specialist memory** | Dies with the child. Job 4 does not remember job 3 unless the parent stuffed it into the next spawn prompt. | The same coder session still has job 3 in its window (and files in the workspace). Handoffs carry the rest. |
 | **Throwaway explore** | **Use this.** Isolated window, parent cache untouched. | Don’t. A peer session is a person on the team, not a sandbox. |
 
-**Rule of thumb:** spawn a sub-agent to protect the caller’s context for a one-shot. Use the bus when the callee **is** a named teammate who will take the next job after this one.
+**Rule of thumb:** spawn a sub-agent to protect the caller’s context for a one-shot. Use the bus when the callee **is** a named teammate — with their own skills, MCP, plugins, and permissions — who will take the next job after this one.
 
 ## Tools
 
