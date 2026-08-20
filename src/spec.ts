@@ -127,6 +127,26 @@ export const flowRecord = z.object({
 export type StoredFlowRecord = z.infer<typeof flowRecord>
 
 /**
+ * Durable shape of one pending note: a send_note that could not be
+ * delivered because the recipient was offline (v1.5). The delivery sweep
+ * retries it once the recipient is live; no acceptance, no receipt.
+ */
+export const pendingMessageRecord = z.object({
+  id: z.string(),
+  sender: sessionId,
+  recipient: sessionId,
+  content: z.string(),
+  /** Original send time (kept across retries for the delayed marker). */
+  sentAt: z.string(),
+  createdAt: z.string(),
+  /** Delivery attempts so far; > 3 drops the message and notifies the sender. */
+  attempts: z.number().int().nonnegative().default(0),
+})
+
+/** One stored pending note, inferred from {@link pendingMessageRecord}. */
+export type StoredPendingMessage = z.infer<typeof pendingMessageRecord>
+
+/**
  * Durable ledger state. `taskIds` is the authoritative creation order, which
  * the listing tools page over without scanning the table. Defaulted so a
  * record written before the field parses unchanged.
@@ -140,17 +160,18 @@ export type AgentBusDomainState = z.infer<typeof agentBusDomainState>
 
 /**
  * The agent-bus domain spec: a `tasks` table keyed by task id, a `peers`
- * table keyed by session id, a `flows` table keyed by flow id, plus the
- * order singleton. Version 8 adds the flows container (`flows` table,
- * `tasks.flowId`) for the v1.4 flow model. Version 9 adds `tasks.handoffs`
- * (structured predecessor handoff documents). The version bump invalidates
- * the storage unit — keep a backup of `agent_bus.json` first (v1.3 §6),
- * then bump the version stamp once after upgrading; the ledger migrates
+ * table keyed by session id, a `flows` table keyed by flow id, a
+ * `pending_messages` table keyed by note id, plus the order singleton.
+ * Version 8 adds the flows container (`flows` table, `tasks.flowId`),
+ * version 9 adds `tasks.handoffs`, version 10 adds `pending_messages`
+ * (durable offline send_note delivery). The version bump invalidates the
+ * storage unit — keep a backup of `agent_bus.json` first (v1.3 §6), then
+ * bump the version stamp once after upgrading; the ledger migrates
  * pre-release `submitted` rows without a messageId to `queued` at open.
  */
 export const agentBusDomainSpec = defineDomain({
   name: 'agent_bus',
-  version: 9,
+  version: 10,
   global: {
     schema: agentBusDomainState,
     initial: { taskIds: [] },
@@ -159,5 +180,6 @@ export const agentBusDomainSpec = defineDomain({
     tasks: domainTable<TaskId, StoredTaskRecord>(taskRecord),
     peers: domainTable<SessionId, StoredPeerCard>(peerCard),
     flows: domainTable<string, StoredFlowRecord>(flowRecord),
+    pending_messages: domainTable<string, StoredPendingMessage>(pendingMessageRecord),
   },
 })

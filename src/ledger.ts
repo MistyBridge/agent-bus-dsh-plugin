@@ -28,6 +28,7 @@ import {
   type AgentBusDomainState,
   type StoredFlowRecord,
   type StoredPeerCard,
+  type StoredPendingMessage,
   type StoredTaskRecord,
 } from './spec.ts'
 import {
@@ -254,6 +255,7 @@ export class TaskLedger {
   private table!: KvTable<TaskId, StoredTaskRecord>
   private peers!: KvTable<SessionId, StoredPeerCard>
   private flows!: KvTable<string, StoredFlowRecord>
+  private pendingNotes!: KvTable<string, StoredPendingMessage>
   private global!: DomainGlobal<AgentBusDomainState>
   private chain: Promise<unknown> = Promise.resolve()
   private ctx!: Context
@@ -276,6 +278,7 @@ export class TaskLedger {
     ledger.table = domain.table('tasks')
     ledger.peers = domain.table('peers')
     ledger.flows = domain.table('flows')
+    ledger.pendingNotes = domain.table('pending_messages')
     ledger.global = domain.global
     await ledger.migrateQueued()
     await ledger.snapshotBackup()
@@ -673,6 +676,51 @@ export class TaskLedger {
   }
 
   /**
+   * Queue one undelivered note (v1.5): the recipient was offline, so the
+   * message is held durably and the delivery sweep retries it once the
+   * recipient is live.
+   *
+   * @param message - the pending note record.
+   */
+  async queueNote(message: StoredPendingMessage): Promise<void> {
+    await this.enqueue(async () => {
+      await this.pendingNotes.put(message.id, message)
+    })
+  }
+
+  /** All queued undelivered notes, oldest first. */
+  listPendingNotes(): StoredPendingMessage[] {
+    return [...this.pendingNotes.entries()]
+      .map(([, note]) => note)
+      .sort((left, right) => left.createdAt.localeCompare(right.createdAt))
+  }
+
+  /**
+   * Remove one delivered (or dropped) note.
+   *
+   * @param id - the note id.
+   */
+  async deleteNote(id: string): Promise<void> {
+    await this.enqueue(async () => {
+      await this.pendingNotes.delete(id)
+    })
+  }
+
+  /**
+   * Bump one note's delivery attempt count (the sweep retries it).
+   *
+   * @param id - the note id.
+   * @param attempts - the new attempt count.
+   */
+  async markNoteAttempt(id: string, attempts: number): Promise<void> {
+    await this.enqueue(async () => {
+      const note = this.pendingNotes.get(id)
+      if (note === undefined) return
+      await this.pendingNotes.put(id, { ...note, attempts })
+    })
+  }
+
+  /**
    * Attach one handoff document to a downstream task: a settled
    * predecessor's executor delivers structured context that dispatch
    * concatenates into the downstream's delivered content.
@@ -681,6 +729,54 @@ export class TaskLedger {
    * @param handoff - the predecessor id, document text, and stamp.
    * @returns the updated row, or a refusal.
    */
+  /**
+   * Reassign an unsettled task (v1.5): move the executor and/or the reviewer
+   * without recreating the task. The task id, history, dependencies, flow
+   * membership, and acceptance criteria all stay — the DAG topology never
+   * changes, only who works and who reviews.
+   *
+   * An executor change clears the delivery identity: the caller re-delivers
+   * to the new worker (the old worker's report is then rejected by the
+   * state machine, since it is no longer assignedTo).
+   *
+   * @param id - the row to reassign.
+   * @param patch - `executor` and/or `reviewer`; absent fields stay put.
+   * @returns the updated row, or a refusal.
+   */
+  async reassign(
+    id: TaskId,
+    patch: { readonly executor?: SessionId; readonly reviewer?: SessionId },
+  ): Promise<LedgerResult> {
+    return this.enqueue(async () => {
+      const current = this.table.get(id)
+      if (current === undefined) {
+        return { ok: false as const, message: `no such task "${id}"` }
+      }
+      if (current.status === 'completed'
+        || current.status === 'failed' || current.status === 'canceled' || current.status === 'rejected') {
+        return {
+          ok: false as const,
+          message: `task "${id}" is ${current.status}; only an unsettled task can be reassigned`,
+        }
+      }
+      const updated: StoredTaskRecord = {
+        ...current,
+        ...(patch.executor !== undefined ? { assignedTo: patch.executor } : {}),
+        ...(patch.reviewer !== undefined ? { assignedReviewer: patch.reviewer } : {}),
+        // The executor changed: the old delivery is void. The caller
+        // re-delivers to the new worker (queued stays queued — no delivery
+        // until the scheduler fires).
+        ...(patch.executor !== undefined
+          ? { messageId: undefined, tokensAtStart: undefined, turn: undefined }
+          : {}),
+        updatedAt: new Date().toISOString(),
+      }
+      await this.table.put(id, updated)
+      this.emitChange(id, 'reassigned', 'reassigned')
+      return { ok: true as const, task: updated }
+    })
+  }
+
   async appendHandoff(id: TaskId, handoff: HandoffEntry): Promise<LedgerResult> {
     return this.enqueue(async () => {
       const current = this.table.get(id)

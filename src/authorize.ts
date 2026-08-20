@@ -26,6 +26,7 @@ export type DenialReason =
   | 'target-not-live'
   | 'target-outside-workspace'
   | 'target-is-subagent'
+  | 'target-not-in-workspace'
   | 'self-delivery'
   | 'not-dispatcher'
   | 'task-not-found'
@@ -50,6 +51,14 @@ export interface PeerGrant {
 
 /** Outcome of a peer authorization request. */
 export type PeerDecision = PeerGrant | Denial
+
+/** Grant for a note recipient (v1.5): the workspace is all that is needed. */
+export interface NoteGrant {
+  readonly ok: true
+  readonly workspacePath: string
+}
+
+export type NoteDecision = NoteGrant | Denial
 
 function deny(reason: DenialReason, message: string): Denial {
   return { ok: false, reason, message }
@@ -184,4 +193,54 @@ export function authorizeSettlement(
     )
   }
   return undefined
+}
+
+/**
+ * Authorize a send_note recipient (v1.5 durable notes).
+ *
+ * Looser than {@link authorizePeer}: the recipient may be OFFLINE — the
+ * note is queued and delivered when the recipient is live again. The
+ * recipient must still be a real session of the caller's workspace (the
+ * same registry index the sidebar uses), so messages never go to strangers
+ * or to other workspaces.
+ *
+ * @param ctx - the plugin context, used to resolve live agents.
+ * @param registry - the workspace registry service.
+ * @param callerId - the session claiming to act.
+ * @param targetId - the intended recipient (may be offline).
+ * @returns a grant with the resolved caller and workspace path, or a refusal.
+ */
+export async function authorizeNoteRecipient(
+  ctx: Context,
+  registry: WorkspaceRegistry,
+  callerId: SessionId,
+  targetId: SessionId,
+): Promise<NoteDecision> {
+  const caller = ctx.agents.get(callerId)
+  if (caller === undefined) {
+    return deny('caller-not-live', 'the calling session is not a live agent')
+  }
+  if (callerId === targetId) {
+    return deny('self-delivery', 'a session cannot send a note to itself')
+  }
+  const callerWorkspace = await resolveWorkspacePath(registry, caller)
+  if (callerWorkspace === undefined) {
+    return deny(
+      'caller-has-no-workspace',
+      'the calling session is not inside a registered workspace, so it has no reachable peers',
+    )
+  }
+  // The recipient must be indexed by the caller's workspace — the same
+  // registry account the sidebar and the session directory use. Attach
+  // state does not matter: an offline recipient gets a queued note.
+  const known = registry.list().some(workspace =>
+    workspace.path === callerWorkspace
+    && workspace.sessionIds.some(id => String(id) === String(targetId)))
+  if (!known) {
+    return deny(
+      'target-not-in-workspace',
+      `session "${targetId}" is not a session of your workspace`,
+    )
+  }
+  return { ok: true, workspacePath: callerWorkspace }
 }

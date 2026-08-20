@@ -23,7 +23,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
-import { authorizePeer, authorizeSettlement, resolveWorkspacePath } from './authorize.ts'
+import { authorizeNoteRecipient, authorizePeer, authorizeSettlement, resolveWorkspacePath } from './authorize.ts'
 import { admitContent, buildMessageMessage, buildTaskMessage, deliverTask, type DeliverySource } from './delivery.ts'
 import type { ReportStore } from './external.ts'
 import { blockedByOf, type TaskLedger } from './ledger.ts'
@@ -502,6 +502,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         additionalProperties: false,
         properties: {
           delivered: { type: 'boolean', required: true },
+          queued: { type: 'boolean', required: true },
           messageId: { type: 'string', required: true },
         },
       },
@@ -509,7 +510,9 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         type: 'text',
         text: result.delivered
           ? `note delivered (${String(result.messageId).slice(0, 8)}…)`
-          : 'note not delivered',
+          : result.queued === true
+            ? `recipient offline — note queued, delivered when they are live (${String(result.messageId).slice(0, 8)}…)`
+            : 'note not delivered',
       }],
     },
     presentCall: (args) => ({ card: 'generic', title: 'agent-bus:发送消息', kind: 'other', rawInput: { target: args.target } }),
@@ -522,16 +525,36 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         )
       }
       const targetId = args.target as SessionId
-      const decision = await authorizePeer(ctx, workspaces, callerId, targetId)
+      // Notes are durable (v1.5): the recipient may be offline — the note is
+      // queued and delivered when the recipient is live again. The looser
+      // authorization still confines recipients to the caller's workspace.
+      const decision = await authorizeNoteRecipient(ctx, workspaces, callerId, targetId)
       if (!decision.ok) throw new Error(decision.message)
       const admitted = admitContent(args.content, config.maxContentLength)
       if (!admitted.ok) throw new Error(admitted.message)
-      // No ledger write: a note has no row, so the claimed-listener cannot
-      // match it and no lifecycle ever starts. The message id is generated
-      // here and returned so the sender keeps a delivery receipt.
-      const message = buildMessageMessage(callerId, randomUUID(), admitted.content)
-      deliverTask(decision.target, message, 'followup')
-      return { delivered: true, messageId: message.id }
+      const messageId = randomUUID()
+      const recipient = ctx.agents.get(targetId)
+      if (recipient === undefined) {
+        // Offline recipient: hold durably, bounded per sender.
+        const queued = ledger.listPendingNotes()
+          .filter(note => note.sender === callerId)
+        if (queued.length >= 50) {
+          throw new Error('your offline note queue is full (50); wait for deliveries or drop old notes')
+        }
+        await ledger.queueNote({
+          id: messageId,
+          sender: callerId,
+          recipient: targetId,
+          content: admitted.content,
+          sentAt: new Date().toISOString(),
+          createdAt: new Date().toISOString(),
+          attempts: 0,
+        })
+        return { delivered: false, queued: true, messageId }
+      }
+      const message = buildMessageMessage(callerId, messageId, admitted.content)
+      deliverTask(recipient, message, 'followup')
+      return { delivered: true, queued: false, messageId }
     },
   }))
 
@@ -588,6 +611,114 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         callerId, workspacePath,
       )
       return { flowId: flow.id, name: flow.name }
+    },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'reassign_task',
+    description:
+      'As the initiator, reassign an unsettled task without recreating it: move the executor '
+      + '(new_executor) and/or the reviewer (new_reviewer). The task id, history, dependencies, '
+      + 'flow membership, and acceptance criteria all stay — only who works and who reviews '
+      + 'changes. A new executor receives the task re-delivered (a working old executor\'s report '
+      + 'is rejected automatically); a queued task simply gets the new owner and still waits for '
+      + 'its dependencies. Use this when a worker dropped out or responsibilities shift — cancel '
+      + 'and recreate is the fallback only for settled tasks.',
+    parameters: {
+      task_id: { type: 'string', required: true, description: 'The unsettled task to reassign.' },
+      new_executor: {
+        type: 'string',
+        description: 'Session id of the new executor, from list_peers; omit to keep the current one.',
+      },
+      new_reviewer: {
+        type: 'string',
+        description: 'Session id of the new reviewer; omit to keep the current one.',
+      },
+    },
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          taskId: { type: 'string', required: true },
+          status: { type: 'string', required: true },
+          executor: { type: 'string' },
+          reviewer: { type: 'string' },
+        },
+      },
+      render: (_args, result) => [{
+        type: 'text',
+        text: `task ${result.taskId} reassigned → ${String(result.status)}`
+          + (result.executor !== undefined ? `, executor: ${result.executor.slice(0, 8)}` : '')
+          + (result.reviewer !== undefined ? `, reviewer: ${result.reviewer.slice(0, 8)}` : ''),
+      }],
+    },
+    presentCall: (args) => ({ card: 'generic', title: 'agent-bus:转派任务', kind: 'other', rawInput: { task_id: args.task_id, ...(args.new_executor !== undefined ? { new_executor: args.new_executor } : {}), ...(args.new_reviewer !== undefined ? { new_reviewer: args.new_reviewer } : {}) } }),
+    presentResult: (_args, result) => ({ card: 'generic', title: 'agent-bus:转派任务', rawInput: result }),
+    async execute(args, exec) {
+      const callerId = requireCaller(exec.agent, 'reassign_task')
+      const taskId = TaskId(args.task_id)
+      const task = ledger.get(taskId)
+      if (task === undefined) throw new Error(`no such task "${taskId}"`)
+      if (task.assignedBy !== callerId) {
+        throw new Error(`only the session that created task "${taskId}" may reassign it`)
+      }
+      if (args.new_executor === undefined && args.new_reviewer === undefined) {
+        throw new Error('reassign_task needs new_executor and/or new_reviewer')
+      }
+      let newExecutor: SessionId | undefined
+      if (args.new_executor !== undefined) {
+        const decision = await authorizePeer(ctx, workspaces, callerId, args.new_executor as SessionId)
+        if (!decision.ok) throw new Error(decision.message)
+        newExecutor = args.new_executor as SessionId
+        // Self-execution keeps an independent reviewer, same rule as create_task.
+        const effectiveReviewer = args.new_reviewer !== undefined
+          ? args.new_reviewer as SessionId
+          : task.assignedReviewer
+        if (newExecutor === callerId
+          && (effectiveReviewer === undefined || effectiveReviewer === callerId)) {
+          throw new Error(
+            'self-execution requires reviewer: when the executor is yourself, name a different session as reviewer',
+          )
+        }
+      }
+      let newReviewer: SessionId | undefined
+      if (args.new_reviewer !== undefined) {
+        const decision = await authorizePeer(ctx, workspaces, callerId, args.new_reviewer as SessionId)
+        if (!decision.ok) throw new Error(decision.message)
+        newReviewer = args.new_reviewer as SessionId
+      }
+      const oldExecutor = task.assignedTo
+      const wasWorking = task.status === 'working' || task.status === 'input-required'
+      const wasQueued = task.status === 'queued'
+      const reassigned = await ledger.reassign(taskId, {
+        ...(newExecutor !== undefined ? { executor: newExecutor } : {}),
+        ...(newReviewer !== undefined ? { reviewer: newReviewer } : {}),
+      })
+      if (!reassigned.ok) throw new Error(reassigned.message)
+
+      // Re-deliver to the new executor: the old delivery was voided by the
+      // reassign. A queued task is not delivered — the scheduler owns it.
+      if (newExecutor !== undefined && !wasQueued) {
+        const message = buildTaskMessage(callerId, taskId,
+          `${reassigned.task.content}\n\n[任务已由 ${oldExecutor ?? '原执行方'} 转派给你执行,请按原要求完成并调用 report_task。]`,
+          'reassign_task')
+        await ledger.recordDelivery(taskId, message.id)
+        const worker = ctx.agents.get(newExecutor)
+        if (worker !== undefined) deliverTask(worker, message, 'followup')
+      }
+      // The old executor is told the task moved (if it was mid-flight).
+      if (oldExecutor !== undefined && newExecutor !== undefined && oldExecutor !== newExecutor && wasWorking) {
+        notifySession(ctx, oldExecutor, taskId,
+          `任务 ${taskId} 已转派给 ${newExecutor.slice(0, 8)},你不再负责该任务。`,
+          'reassign_task')
+      }
+      return {
+        taskId: String(taskId),
+        status: reassigned.task.status,
+        ...(reassigned.task.assignedTo !== undefined ? { executor: String(reassigned.task.assignedTo) } : {}),
+        ...(reassigned.task.assignedReviewer !== undefined ? { reviewer: String(reassigned.task.assignedReviewer) } : {}),
+      }
     },
   }))
 

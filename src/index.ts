@@ -37,6 +37,7 @@ import { ReportStore } from './external.ts'
 import { TaskLedger } from './ledger.ts'
 import { buildPanelSnapshot } from './panel.ts'
 import { DispatchRateLimiter } from './rate-limit.ts'
+import { buildDelayedMessage, deliverTask } from './delivery.ts'
 import { dispatchOne, dispatchReadyTasks, releaseDependents } from './scheduler.ts'
 import { notifySession, registerAgentBusTools, type ToolsConfig } from './tools.ts'
 import { TaskId } from './types.ts'
@@ -66,6 +67,8 @@ export interface Config {
   maxMessagesPerMinute?: number
   /** How long a working or input-required task may sit before failing (default `7200000`, 2 hours). */
   taskTimeoutMs?: number
+  /** How long a working task's offline executor may be gone before the initiator is asked to decide (default `900000`, 15 min). */
+  offlineGraceMs?: number
   /** Reports longer than this are externalized to the report store (default `400`). */
   maxInlineReport?: number
   /** Prompt-section order for the usage policy (default `118`). */
@@ -78,6 +81,7 @@ export const Config: z<Config> = z.object({
   maxSendsPerMinute: z.natural().min(1).default(10),
   maxMessagesPerMinute: z.natural().min(1).default(20),
   taskTimeoutMs: z.natural().min(60_000).default(7_200_000),
+  offlineGraceMs: z.natural().min(60_000).default(900_000),
   maxInlineReport: z.natural().min(1).default(400),
   promptSectionOrder: z.natural().default(118),
 })
@@ -335,10 +339,33 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   // notified — a timeout means a side of the loop went quiet, and the
   // initiator is the one who can decide to redo it.
   const timeoutMs = config.taskTimeoutMs ?? 7_200_000
+  const offlineGraceMs = config.offlineGraceMs ?? 900_000
+  const lastOfflineNotice = new Map<string, number>()
   const timer = setInterval(() => {
     const cutoff = Date.now() - timeoutMs
+    const now = Date.now()
     for (const row of ledger.listAll()) {
       if (row.status !== 'working' && row.status !== 'input-required') continue
+      // Offline-executor grace (v1.5): a working task whose executor has been
+      // away past the grace period asks the INITIATOR to decide — reassign,
+      // cancel, or wait. Never auto-fails: offline is not failure, the 2h
+      // timeout stays as the backstop. Cooldown rides the task state so a
+      // restart cannot re-nag.
+      if (row.status === 'working' && row.assignedTo !== undefined
+        && ctx.agents.get(row.assignedTo) === undefined) {
+        const idleMs = now - Date.parse(row.updatedAt)
+        if (idleMs >= offlineGraceMs) {
+          const key = String(row.id)
+          const last = lastOfflineNotice.get(key) ?? 0
+          if (now - last >= 15 * 60 * 1000) {
+            lastOfflineNotice.set(key, now)
+            notifySession(ctx, row.assignedBy, row.id,
+              `任务 ${row.id} 的执行方(${row.assignedTo.slice(0, 8)})已离线超过 ${Math.round(offlineGraceMs / 60_000)} 分钟。`
+                + `请决策:reassign_task 转派,或 cancel_task 取消,或等待其返回。`,
+              'reminder')
+          }
+        }
+      }
       if (Date.parse(row.updatedAt) > cutoff) continue
       const reason = row.status === 'working' ? 'timeout' : 'no-response'
       void ledger.transition(row.id, 'failed', { reason }).then(() => {
@@ -351,6 +378,37 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   }, Math.min(timeoutMs / 2, 600_000))
   timer.unref?.()
   ctx.effect(() => () => clearInterval(timer), 'agent-bus.timeoutSweep')
+
+  // Durable-note sweep (v1.5): deliver queued notes once their recipient is
+  // live again. A delivery that fails again returns the note to the queue
+  // (attempts+1); after 3 failed attempts the note is dropped and the sender
+  // is notified. Idempotent by construction — each note is deleted exactly
+  // when delivered.
+  const NOTE_MAX_ATTEMPTS = 3
+  const noteSweep = setInterval(() => {
+    void (async () => {
+      for (const note of ledger.listPendingNotes()) {
+        const recipient = ctx.agents.get(note.recipient)
+        if (recipient === undefined) continue
+        if (note.attempts >= NOTE_MAX_ATTEMPTS) {
+          await ledger.deleteNote(note.id)
+          notifySession(ctx, note.sender, TaskId(note.id),
+            `你的离线消息(发送于 ${note.sentAt})经过 ${NOTE_MAX_ATTEMPTS} 次补投仍未送达,已丢弃。如需重新发送,请调用 send_note。`,
+            'reminder')
+          continue
+        }
+        try {
+          const message = buildDelayedMessage(note.sender, note.id, note.content, note.sentAt)
+          deliverTask(recipient, message, 'followup')
+          await ledger.deleteNote(note.id)
+        } catch {
+          await ledger.markNoteAttempt(note.id, note.attempts + 1)
+        }
+      }
+    })()
+  }, 60_000)
+  noteSweep.unref?.()
+  ctx.effect(() => () => clearInterval(noteSweep), 'agent-bus.noteSweep')
 
   // Report-store sweep: hot files idle past 7 days and cold files idle past
   // 30 days are removed. Runs hourly; unref'd so it never holds the process.
