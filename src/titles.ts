@@ -11,9 +11,19 @@
 
 import { readFile } from 'node:fs/promises'
 
-/** Fallback shown when a session's title cannot be resolved. */
+/**
+ * Fallback shown when a session's title cannot be resolved.
+ *
+ * Session ids are `session-<uuid>`; slicing the raw id yields the useless
+ * literal "session-", so the prefix is dropped and the short uuid fragment
+ * is shown instead (e.g. `6e2cafd9`) — a dormant session stays identifiable
+ * in the directory even before it ever got a title.
+ */
 export function fallbackTitle(sessionId: string): string {
-  return sessionId.slice(0, 8)
+  const short = sessionId.startsWith('session-')
+    ? sessionId.slice('session-'.length)
+    : sessionId
+  return short.slice(0, 8)
 }
 
 /**
