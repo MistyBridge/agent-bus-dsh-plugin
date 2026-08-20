@@ -23,13 +23,14 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { WorkspaceRegistry } from '@deepseek-ai/dsh-workspace'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { Session } from '@deepseek-ai/dsh-session'
-import { authorizeNoteRecipient, authorizePeer, authorizeSettlement, resolveWorkspacePath } from './authorize.ts'
+import { authorizeNoteRecipient, authorizePeerOrDormant, authorizeSettlement, resolveWorkspacePath } from './authorize.ts'
 import { admitContent, buildMessageMessage, buildTaskMessage, deliverTask, type DeliverySource } from './delivery.ts'
 import type { ReportStore } from './external.ts'
 import { blockedByOf, type TaskLedger } from './ledger.ts'
 import { isTokenBuckets, staffRoles } from './panel.ts'
 import { DispatchRateLimiter } from './rate-limit.ts'
 import { dispatchOne } from './scheduler.ts'
+import { wakeSession } from './wake.ts'
 import { TaskId, type DeliveryMode, type TaskRecord, type TokenBuckets } from './types.ts'
 
 /** Resolved plugin configuration the tools read. */
@@ -533,28 +534,31 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       const admitted = admitContent(args.content, config.maxContentLength)
       if (!admitted.ok) throw new Error(admitted.message)
       const messageId = randomUUID()
-      const recipient = ctx.agents.get(targetId)
-      if (recipient === undefined) {
-        // Offline recipient: hold durably, bounded per sender.
-        const queued = ledger.listPendingNotes()
-          .filter(note => note.sender === callerId)
-        if (queued.length >= 50) {
-          throw new Error('your offline note queue is full (50); wait for deliveries or drop old notes')
-        }
-        await ledger.queueNote({
-          id: messageId,
-          sender: callerId,
-          recipient: targetId,
-          content: admitted.content,
-          sentAt: new Date().toISOString(),
-          createdAt: new Date().toISOString(),
-          attempts: 0,
-        })
-        return { delivered: false, queued: true, messageId }
+      // Wake-on-delivery: a dormant recipient is resumed so the note lands
+      // immediately; only a session that cannot be woken falls back to the
+      // durable queue.
+      const recipient = await wakeSession(ctx, targetId)
+      if (recipient !== undefined) {
+        const message = buildMessageMessage(callerId, messageId, admitted.content)
+        deliverTask(recipient, message, 'followup')
+        return { delivered: true, queued: false, messageId }
       }
-      const message = buildMessageMessage(callerId, messageId, admitted.content)
-      deliverTask(recipient, message, 'followup')
-      return { delivered: true, queued: false, messageId }
+      // Unwakeable offline recipient: hold durably, bounded per sender.
+      const queued = ledger.listPendingNotes()
+        .filter(note => note.sender === callerId)
+      if (queued.length >= 50) {
+        throw new Error('your offline note queue is full (50); wait for deliveries or drop old notes')
+      }
+      await ledger.queueNote({
+        id: messageId,
+        sender: callerId,
+        recipient: targetId,
+        content: admitted.content,
+        sentAt: new Date().toISOString(),
+        createdAt: new Date().toISOString(),
+        attempts: 0,
+      })
+      return { delivered: false, queued: true, messageId }
     },
   }))
 
@@ -668,7 +672,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       }
       let newExecutor: SessionId | undefined
       if (args.new_executor !== undefined) {
-        const decision = await authorizePeer(ctx, workspaces, callerId, args.new_executor as SessionId)
+        const decision = await authorizePeerOrDormant(ctx, workspaces, callerId, args.new_executor as SessionId)
         if (!decision.ok) throw new Error(decision.message)
         newExecutor = args.new_executor as SessionId
         // Self-execution keeps an independent reviewer, same rule as create_task.
@@ -684,7 +688,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       }
       let newReviewer: SessionId | undefined
       if (args.new_reviewer !== undefined) {
-        const decision = await authorizePeer(ctx, workspaces, callerId, args.new_reviewer as SessionId)
+        const decision = await authorizePeerOrDormant(ctx, workspaces, callerId, args.new_reviewer as SessionId)
         if (!decision.ok) throw new Error(decision.message)
         newReviewer = args.new_reviewer as SessionId
       }
@@ -698,14 +702,20 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       if (!reassigned.ok) throw new Error(reassigned.message)
 
       // Re-deliver to the new executor: the old delivery was voided by the
-      // reassign. A queued task is not delivered — the scheduler owns it.
+      // reassign. A queued task is not delivered — the scheduler owns it. A
+      // dormant new executor is woken; an unwakeable one falls back to queued
+      // and the sweep retries.
       if (newExecutor !== undefined && !wasQueued) {
         const message = buildTaskMessage(callerId, taskId,
           `${reassigned.task.content}\n\n[任务已由 ${oldExecutor ?? '原执行方'} 转派给你执行,请按原要求完成并调用 report_task。]`,
           'reassign_task')
-        await ledger.recordDelivery(taskId, message.id)
-        const worker = ctx.agents.get(newExecutor)
-        if (worker !== undefined) deliverTask(worker, message, 'followup')
+        const worker = await wakeSession(ctx, newExecutor)
+        if (worker !== undefined) {
+          await ledger.recordDelivery(taskId, message.id)
+          deliverTask(worker, message, 'followup')
+        } else {
+          await ledger.transition(taskId, 'queued')
+        }
       }
       // The old executor is told the task moved (if it was mid-flight).
       if (oldExecutor !== undefined && newExecutor !== undefined && oldExecutor !== newExecutor && wasWorking) {
@@ -918,7 +928,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
         )
       }
       const targetId = args.target as SessionId
-      const decision = await authorizePeer(ctx, workspaces, callerId, targetId)
+      const decision = await authorizePeerOrDormant(ctx, workspaces, callerId, targetId)
       if (!decision.ok) throw new Error(decision.message)
 
       const admitted = admitContent(args.content, config.maxContentLength)
@@ -955,7 +965,7 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       const taskId = TaskId(randomTaskId())
       let reviewer: SessionId | undefined
       if (args.reviewer !== undefined) {
-        const reviewerDecision = await authorizePeer(ctx, workspaces, callerId, args.reviewer as SessionId)
+        const reviewerDecision = await authorizePeerOrDormant(ctx, workspaces, callerId, args.reviewer as SessionId)
         if (!reviewerDecision.ok) throw new Error(reviewerDecision.message)
         reviewer = args.reviewer as SessionId
       }
@@ -1002,13 +1012,21 @@ export function registerAgentBusTools(ctx: Context, config: ToolsConfig, deps: T
       // A task with dependencies is created queued(待投递) without delivery
       // until every predecessor settles; the scheduler delivers it then. A
       // task whose dependencies are already settled delivers immediately,
-      // recording the message id before the inbox can claim it.
+      // recording the message id before the inbox can claim it. A dormant
+      // target is WOKEN (v1.5): the harness resumes the persisted session,
+      // so the dispatch never fails on a closed tab; if the session cannot
+      // be woken the task falls back to queued and the sweep retries.
       const blocked: string[] = dependencies === undefined
         ? []
         : [...blockedByOf(recorded.task, ledger.listAll()).map(String)]
       if (blocked.length === 0) {
-        await ledger.recordDelivery(taskId, message.id)
-        deliverTask(decision.target, message, mode)
+        const target = await wakeSession(ctx, targetId)
+        if (target !== undefined) {
+          await ledger.recordDelivery(taskId, message.id)
+          deliverTask(target, message, mode)
+        } else {
+          await ledger.transition(taskId, 'queued')
+        }
       }
       const pending = ledger.listFor(targetId).filter(
         row => row.status === 'submitted' || row.status === 'working' || row.status === 'input-required',

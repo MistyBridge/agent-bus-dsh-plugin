@@ -27,6 +27,7 @@ export type DenialReason =
   | 'target-outside-workspace'
   | 'target-is-subagent'
   | 'target-not-in-workspace'
+  | 'target-archived'
   | 'self-delivery'
   | 'not-dispatcher'
   | 'task-not-found'
@@ -232,7 +233,10 @@ export async function authorizeNoteRecipient(
   }
   // The recipient must be indexed by the caller's workspace — the same
   // registry account the sidebar and the session directory use. Attach
-  // state does not matter: an offline recipient gets a queued note.
+  // state does not matter: an offline recipient gets a queued note. A
+  // manually ARCHIVED session is out of reach: the user archived it, so it
+  // must not be woken.
+  const archived = new Set((registry.archivedSessionIds ?? []).map(String))
   const known = registry.list().some(workspace =>
     workspace.path === callerWorkspace
     && workspace.sessionIds.some(id => String(id) === String(targetId)))
@@ -242,5 +246,90 @@ export async function authorizeNoteRecipient(
       `session "${targetId}" is not a session of your workspace`,
     )
   }
+  if (archived.has(String(targetId))) {
+    return deny(
+      'target-archived',
+      `session "${targetId}" is archived; unarchive it in the workspace before sending notes`,
+    )
+  }
   return { ok: true, workspacePath: callerWorkspace }
+}
+
+/**
+ * Authorize a delivery target that may be DORMANT (v1.5 wake-on-delivery).
+ *
+ * Looser than {@link authorizePeer}: the target may be offline, as long as
+ * it is a real session of the caller's workspace (the same registry index
+ * the sidebar uses). The caller still must be live and inside a workspace;
+ * the target's identity is the registry account, never a guess. The caller
+ * then wakes the target (see wake.ts) and delivers; if waking fails, the
+ * task stays queued or the note is queued offline.
+ *
+ * @param ctx - the plugin context, used to resolve live agents.
+ * @param registry - the workspace registry service.
+ * @param callerId - the session claiming to act.
+ * @param targetId - the intended target (may be dormant).
+ * @returns a grant with the caller, workspace path, and liveness of the
+ *   target, or a refusal.
+ */
+export async function authorizePeerOrDormant(
+  ctx: Context,
+  registry: WorkspaceRegistry,
+  callerId: SessionId,
+  targetId: SessionId,
+): Promise<PeerDecision> {
+  const caller = ctx.agents.get(callerId)
+  if (caller === undefined) {
+    return deny('caller-not-live', 'the calling session is not a live agent')
+  }
+  if (callerId === targetId) {
+    // Self-execution is allowed; reviewer independence is enforced by the
+    // caller (create_task / reassign_task), never here.
+    const workspacePath = await resolveWorkspacePath(registry, caller)
+    if (workspacePath === undefined) {
+      return deny(
+        'caller-has-no-workspace',
+        'the calling session is not inside a registered workspace, so it has no reachable peers',
+      )
+    }
+    return { ok: true, caller, target: caller, workspacePath }
+  }
+  const callerWorkspace = await resolveWorkspacePath(registry, caller)
+  if (callerWorkspace === undefined) {
+    return deny(
+      'caller-has-no-workspace',
+      'the calling session is not inside a registered workspace, so it has no reachable peers',
+    )
+  }
+  const known = registry.list().some(workspace =>
+    workspace.path === callerWorkspace
+    && workspace.sessionIds.some(id => String(id) === String(targetId)))
+  if (!known) {
+    return deny(
+      'target-not-in-workspace',
+      `session "${targetId}" is not a session of your workspace`,
+    )
+  }
+  // A manually archived session is out of reach: the user archived it, so it
+  // must not be woken or delivered to.
+  const archived = new Set((registry.archivedSessionIds ?? []).map(String))
+  if (archived.has(String(targetId))) {
+    return deny(
+      'target-archived',
+      `session "${targetId}" is archived; unarchive it in the workspace before dispatching to it`,
+    )
+  }
+  const live = ctx.agents.get(targetId)
+  if (live !== undefined && live.session.header.origin === 'subagent') {
+    return deny(
+      'target-is-subagent',
+      `session "${targetId}" is a subagent owned by another session; dispatch reaches independent sessions only`,
+    )
+  }
+  return {
+    ok: true,
+    caller,
+    target: live ?? caller, // dormant: wake.ts provides the real agent
+    workspacePath: callerWorkspace,
+  }
 }

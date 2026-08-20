@@ -16,6 +16,7 @@ import type { SessionId } from '@deepseek-ai/dsh-session'
 import { buildTaskMessage, deliverTask } from './delivery.ts'
 import { blockedByOf, type TaskLedger } from './ledger.ts'
 import type { TaskId } from './types.ts'
+import { wakeSession } from './wake.ts'
 
 /** Deliver one notice to a live session (the scheduler's only notification). */
 function notifySession(ctx: Context, sessionId: SessionId, taskId: TaskId, text: string): void {
@@ -43,8 +44,11 @@ export async function dispatchOne(ctx: Context, ledger: TaskLedger, id: TaskId):
   const task = ledger.get(id)
   if (task === undefined || task.assignedTo === undefined) return
   if (task.status !== 'queued') return // idempotent: nothing to deliver
-  const worker = ctx.agents.get(task.assignedTo)
-  if (worker === undefined) return // offline worker: the row stays queued and the sweep retries
+  // Wake-on-delivery (v1.5): a dormant worker is resumed instead of leaving
+  // the row queued; only an unwakeable session keeps the row queued for the
+  // next sweep.
+  const worker = await wakeSession(ctx, task.assignedTo)
+  if (worker === undefined) return // unwakeable worker: the row stays queued and the sweep retries
   // Handoff documents from settled predecessors ride along: structured
   // context (values, decisions, caveats) concatenated after the instruction,
   // so the worker reads the chain's state instead of excavating old reports.
